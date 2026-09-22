@@ -17,9 +17,11 @@
 #include "components/RenderableManager.h"
 
 #include "details/Engine.h"
-#include "details/VertexBuffer.h"
 #include "details/IndexBuffer.h"
 #include "details/Material.h"
+#include "details/VertexBuffer.h"
+
+#include <utils/Panic.h>
 
 using namespace utils;
 
@@ -46,6 +48,10 @@ Entity RenderableManager::getEntity(Instance const i) const noexcept {
 
 Entity const* RenderableManager::getEntities() const noexcept {
     return downcast(this)->getEntities();
+}
+
+Slice<Entity const> RenderableManager::getAllEntities() const noexcept {
+    return downcast(this)->getAllEntities();
 }
 
 RenderableManager::Instance
@@ -165,20 +171,46 @@ AttributeBitset RenderableManager::getEnabledAttributesAt(Instance const instanc
 }
 
 void RenderableManager::setGeometryAt(Instance const instance, size_t const primitiveIndex,
+        PrimitiveType const type, VertexBuffer* vertices, IndexBuffer* indices) {
+    setGeometryAt(instance, primitiveIndex, type, vertices, indices, 0, indices->getIndexCount());
+}
+
+void RenderableManager::setGeometryAt(Instance const instance, size_t const primitiveIndex,
         PrimitiveType const type, VertexBuffer* vertices, IndexBuffer* indices,
-        size_t const offset, size_t const count) noexcept {
+        size_t const offset, size_t const count) {
+    FILAMENT_CHECK_PRECONDITION(vertices->isCreationComplete())
+            << "VertexBuffer's creation is still in progress or was canceled";
+
+    FILAMENT_CHECK_PRECONDITION(indices->isCreationComplete())
+            << "IndexBuffer's creation is still in progress or was canceled";
+
     downcast(this)->setGeometryAt(instance, 0, primitiveIndex,
             type, downcast(vertices), downcast(indices), offset, count);
 }
 
-void RenderableManager::setBones(Instance const instance,
-        Bone const* transforms, size_t const boneCount, size_t const offset) {
-    downcast(this)->setBones(instance, transforms, boneCount, offset);
+void RenderableManager::setGeometryAt(Instance const instance, size_t const primitiveIndex,
+        PrimitiveType const type, VertexBuffer* vertices) {
+    setGeometryAt(instance, primitiveIndex, type, vertices, 0, vertices->getVertexCount());
+}
+
+void RenderableManager::setGeometryAt(Instance const instance, size_t const primitiveIndex,
+        PrimitiveType const type, VertexBuffer* vertices,
+        size_t const offset, size_t const count) {
+    FILAMENT_CHECK_PRECONDITION(vertices->isCreationComplete())
+            << "VertexBuffer's creation is still in progress or was canceled";
+
+    downcast(this)->setGeometryAt(instance, 0, primitiveIndex,
+            type, downcast(vertices), offset, count);
 }
 
 void RenderableManager::setBones(Instance const instance,
-        mat4f const* transforms, size_t const boneCount, size_t const offset) {
-    downcast(this)->setBones(instance, transforms, boneCount, offset);
+        Slice<const Bone> transforms, size_t const offset) {
+    downcast(this)->setBones(instance, transforms.data(), transforms.size(), offset);
+}
+
+void RenderableManager::setBones(Instance const instance,
+        Slice<const mat4f> transforms, size_t const offset) {
+    downcast(this)->setBones(instance, transforms.data(), transforms.size(), offset);
 }
 
 void RenderableManager::setSkinningBuffer(Instance const instance,
@@ -186,9 +218,9 @@ void RenderableManager::setSkinningBuffer(Instance const instance,
     downcast(this)->setSkinningBuffer(instance, downcast(skinningBuffer), count, offset);
 }
 
-void RenderableManager::setMorphWeights(Instance const instance, float const* weights,
-        size_t const count, size_t const offset) {
-    downcast(this)->setMorphWeights(instance, weights, count, offset);
+void RenderableManager::setMorphWeights(Instance const instance,
+        Slice<const float> weights, size_t const offset) {
+    downcast(this)->setMorphWeights(instance, weights.data(), weights.size(), offset);
 }
 
 void RenderableManager::setMorphTargetBufferOffsetAt(Instance const instance, uint8_t const level,

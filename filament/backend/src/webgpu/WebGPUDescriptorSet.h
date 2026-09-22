@@ -17,11 +17,10 @@
 #ifndef TNT_FILAMENT_BACKEND_WEBGPUDESCRIPTORSET_H
 #define TNT_FILAMENT_BACKEND_WEBGPUDESCRIPTORSET_H
 
+#include "DriverBase.h"
+#include "WebGPUConstants.h"
 #include "WebGPUDescriptorSetLayout.h"
 
-#include "WebGPUConstants.h"
-
-#include "DriverBase.h"
 #include <backend/DriverEnums.h>
 
 #include <webgpu/webgpu_cpp.h>
@@ -41,6 +40,8 @@ namespace filament::backend {
   */
 class WebGPUDescriptorSet final : public HwDescriptorSet {
 public:
+    static constexpr size_t MAX_WEBGPU_BINDINGS_PER_SET = 2 * MAX_DESCRIPTOR_COUNT;
+
     WebGPUDescriptorSet(wgpu::BindGroupLayout const&,
             std::vector<WebGPUDescriptorSetLayout::BindGroupEntryInfo> const&);
     ~WebGPUDescriptorSet();
@@ -80,7 +81,7 @@ public:
 
 private:
     wgpu::BindGroupLayout mLayout = nullptr;
-    std::array<uint8_t, MAX_DESCRIPTOR_COUNT> mEntryIndexByBinding{};
+    std::array<uint8_t, MAX_WEBGPU_BINDINGS_PER_SET> mEntryIndexByBinding{};
     std::vector<wgpu::BindGroupEntry> mEntries;
     const size_t mEntriesWithDynamicOffsetsCount;
     // This is created lazily when lockAndReturn is called.

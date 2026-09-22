@@ -18,6 +18,7 @@
 #define TNT_FILAMENT_BACKEND_VULKAN_MEMORY_RESOURCE_H
 
 #include <private/backend/HandleAllocator.h>
+
 #include <utils/Mutex.h>
 
 #include <atomic>
@@ -70,7 +71,8 @@ inline bool isThreadSafeType(ResourceType type) {
     return type == ResourceType::PROGRAM ||
            type == ResourceType::FENCE ||
            type == ResourceType::TIMER_QUERY ||
-           type == ResourceType::SYNC;
+           type == ResourceType::SYNC ||
+           type == ResourceType::STREAM;
 }
 
 struct Resource {

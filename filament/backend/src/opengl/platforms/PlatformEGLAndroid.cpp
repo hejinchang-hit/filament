@@ -14,52 +14,54 @@
  * limitations under the License.
  */
 
-#include <backend/platforms/PlatformEGLAndroid.h>
+#include "AndroidNativeWindow.h"
+#include "AndroidSwapChainHelper.h"
+#include "ExternalStreamManagerAndroid.h"
 
 #include "opengl/GLUtils.h"
+
+#include <private/backend/BackendUtilsAndroid.h>
+#include <private/backend/VirtualMachineEnv.h>
 
 #include <backend/AcquiredImage.h>
 #include <backend/DriverEnums.h>
 #include <backend/Platform.h>
 #include <backend/platforms/OpenGLPlatform.h>
 #include <backend/platforms/PlatformEGL.h>
+#include <backend/platforms/PlatformEGLAndroid.h>
 
-#include <private/backend/BackendUtilsAndroid.h>
-#include <private/backend/VirtualMachineEnv.h>
-
-#include "AndroidNativeWindow.h"
-#include "AndroidFrameCallback.h"
-#include "AndroidSwapChainHelper.h"
-#include "ExternalStreamManagerAndroid.h"
-
-#include <android/api-level.h>
-#include <android/native_window.h>
-#include <android/hardware_buffer.h>
+#include <private/utils/FeatureFlagManager.h>
 
 #include <utils/android/PerformanceHintManager.h>
+#include <utils/api_level.h>
 #include <utils/compiler.h>
 #include <utils/debug.h>
 #include <utils/Logger.h>
-#include <utils/Panic.h>
 #include <utils/ostream.h>
+#include <utils/Panic.h>
 
 #include <math/mat3.h>
 
+#include <android/api-level.h>
+#include <android/hardware_buffer.h>
+#include <android/native_window.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-
-#include <sys/system_properties.h>
-
 #include <jni.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <string_view>
 
+#include <sys/system_properties.h>
 #include <unistd.h>
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -67,8 +69,13 @@
 // We require filament to be built with an API 19 toolchain, before that, OpenGLES 3.0 didn't exist
 // Actually, OpenGL ES 3.0 was added to API 18, but API 19 is the better target and
 // the minimum for Jetpack at the time of this comment.
-#if __ANDROID_API__ < 19
-#   error "__ANDROID_API__ must be at least 19"
+#if FILAMENT_ANDROID_PLATFORM_API_LEVEL < 19
+#error "FILAMENT_ANDROID_PLATFORM_API_LEVEL must be at least 19"
+#endif
+
+// Fallback for NDKs older than API 28.
+#ifndef AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE
+#define AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE 0x4000000ULL
 #endif
 
 using namespace utils;
@@ -107,20 +114,16 @@ struct PlatformEGLAndroid::SwapChainEGLAndroid : public SwapChainEGL {
     bool setPresentFrameId(uint64_t frameId) const noexcept;
     uint64_t getFrameId(uint64_t frameId) const noexcept;
     bool compositorTimingSupported = false;
-    bool frameTimestampsSupported = false;
+    mutable std::atomic<bool> frameTimestampsSupported{false};
+    mutable std::atomic<bool> frameTimestampsEverRetrieved{false};
+    std::atomic<uint32_t> presentCount{0};
 private:
     AndroidSwapChainHelper mImpl{};
 };
 
-struct PlatformEGLAndroid::AndroidDetails {
-    AndroidProducerThrottling producerThrottling;
-    AndroidFrameCallback androidFrameCallback;
-};
-
 // ---------------------------------------------------------------------------------------------
 
-PlatformEGLAndroid::PlatformEGLAndroid() noexcept
-        : mAndroidDetails(*(new(std::nothrow) AndroidDetails{})) {
+PlatformEGLAndroid::PlatformEGLAndroid() noexcept  {
     mOSVersion = android_get_device_api_level();
     if (mOSVersion < 0) {
         mOSVersion = __ANDROID_API_FUTURE__;
@@ -128,12 +131,10 @@ PlatformEGLAndroid::PlatformEGLAndroid() noexcept
 }
 
 PlatformEGLAndroid::~PlatformEGLAndroid() noexcept {
-    delete &mAndroidDetails;
 }
 
 void PlatformEGLAndroid::terminate() noexcept {
     mPerformanceHintManager.terminate();
-    mAndroidDetails.androidFrameCallback.terminate();
     if (mExternalStreamManager) {
         ExternalStreamManagerAndroid::destroy(mExternalStreamManager);
         mExternalStreamManager = nullptr;
@@ -158,11 +159,21 @@ bool PlatformEGLAndroid::makeCurrent(ContextType const type,
 
     SwapChainEGL const* const dsc = static_cast<SwapChainEGL const*>(drawSwapChain);
     // anw can be nullptr if we're using a pbuffer surface
-    if (dsc->nativeWindow) {
+    if (dsc && dsc->nativeWindow) {
         auto [err, valid] = NativeWindow::isValid(dsc->nativeWindow);
         FILAMENT_CHECK_POSTCONDITION(!err && valid) << kNativeWindowInvalidMsg << dsc->sur;
     }
     return PlatformEGL::makeCurrent(type, drawSwapChain, readSwapChain);
+}
+
+void PlatformEGLAndroid::commit(SwapChain* swapChain) noexcept {
+    if (UTILS_LIKELY(swapChain)) {
+        SwapChainEGLAndroid* const sc = static_cast<SwapChainEGLAndroid*>(swapChain);
+        if (UTILS_LIKELY(sc->sur != EGL_NO_SURFACE)) {
+            sc->presentCount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    PlatformEGL::commit(swapChain);
 }
 
 void PlatformEGLAndroid::beginFrame(
@@ -204,8 +215,8 @@ void PlatformEGLAndroid::beginFrame(
 
 void PlatformEGLAndroid::preCommit() noexcept {
     if (mPerformanceHintSession.isValid()) {
-        auto const actualWorkDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                clock::now() - mStartTimeOfActualWork);
+        auto const actualWorkDuration =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - mStartTimeOfActualWork);
         mPerformanceHintSession.reportActualWorkDuration(actualWorkDuration.count());
     }
     PlatformEGL::preCommit();
@@ -216,7 +227,7 @@ Driver* PlatformEGLAndroid::createDriver(void* sharedContext,
 
     // PerformanceHintManager() needs the calling thread to be a Java thread; so we need
     // to attach this thread to the JVM before we initialize PerformanceHintManager.
-    if (PerformanceHintManager::isSupported()) {
+    if (PerformanceHintManager::isSupported() && VirtualMachineEnv::hasVirtualMachine()) {
         (void)VirtualMachineEnv::get().getEnvironment();
     }
 
@@ -272,9 +283,10 @@ Driver* PlatformEGLAndroid::createDriver(void* sharedContext,
                         "eglDupNativeFenceFDANDROID"));
     }
 
-    mAssertNativeWindowIsValid = driverConfig.assertNativeWindowIsValid;
-
-    mAndroidDetails.androidFrameCallback.init();
+    mAssertNativeWindowIsValid =
+            (driverConfig.featureFlagManager ? driverConfig.featureFlagManager->features.backend
+                                                       .opengl.assert_native_window_is_valid
+                                             : false);
 
     return driver;
 }
@@ -297,21 +309,6 @@ bool PlatformEGLAndroid::queryCompositorTiming(SwapChain const* swapchain,
         return false;
     }
 
-    AndroidFrameCallback::Timeline const preferredTimeline{
-            mAndroidDetails.androidFrameCallback.getPreferredTimeline() };
-    // FIXME: expectedPresentLatency might reflect the previous frame's value because
-    //        the choreographer's callback can happen before (good) or after (bad) us.
-    //        This problem is mitigated by storing the latency instead of the deadline,
-    //        because it generally is constant frame to frame.
-    if (UTILS_LIKELY(preferredTimeline.expectedPresentTime > preferredTimeline.frameTime)) {
-        // latency can never be negative, let's be safe
-        outCompositorTiming->expectedPresentLatency =
-                preferredTimeline.expectedPresentTime - preferredTimeline.frameTime;
-    } else {
-        // fake a reasonable value (33ms)
-        outCompositorTiming->expectedPresentLatency = 33'000'000;
-    }
-    outCompositorTiming->compositeDeadline = CompositorTiming::INVALID;
     outCompositorTiming->compositeInterval = CompositorTiming::INVALID;
     outCompositorTiming->compositeToPresentLatency = CompositorTiming::INVALID;
 
@@ -328,9 +325,8 @@ bool PlatformEGLAndroid::queryCompositorTiming(SwapChain const* swapchain,
             return true;
         }
 
-        std::array<EGLnsecsANDROID, 3> values;
-        constexpr std::array<EGLint, 3> names{
-            EGL_COMPOSITE_DEADLINE_ANDROID,
+        std::array<EGLnsecsANDROID, 2> values;
+        constexpr std::array names{
             EGL_COMPOSITE_INTERVAL_ANDROID,
             EGL_COMPOSITE_TO_PRESENT_LATENCY_ANDROID
         };
@@ -340,9 +336,8 @@ bool PlatformEGLAndroid::queryCompositorTiming(SwapChain const* swapchain,
             // reset current error to EGL_SUCCESS
             eglGetError();
         } else {
-            outCompositorTiming->compositeDeadline = values[0];
-            outCompositorTiming->compositeInterval = values[1];
-            outCompositorTiming->compositeToPresentLatency = values[2];
+            outCompositorTiming->compositeInterval = values[0];
+            outCompositorTiming->compositeToPresentLatency = values[1];
         }
     }
     return true;
@@ -370,7 +365,7 @@ bool PlatformEGLAndroid::queryFrameTimestamps(SwapChain const* swapchain, uint64
         return false;
     }
 
-    if (!static_cast<SwapChainEGLAndroid const *>(swapchain)->frameTimestampsSupported) {
+    if (!sc->frameTimestampsSupported.load(std::memory_order_relaxed)) {
         return false;
     }
 
@@ -395,10 +390,17 @@ bool PlatformEGLAndroid::queryFrameTimestamps(SwapChain const* swapchain, uint64
         EGLBoolean const success = eglGetFrameTimestampsANDROID(getEglDisplay(), sur, hwFrameId,
                 names.size(), names.data(), values.data());
         if (UTILS_UNLIKELY(!success)) {
-            // reset current error to EGL_SUCCESS
-            eglGetError();
+            EGLint const err = eglGetError();
+            if (err == EGL_BAD_SURFACE ||
+                (!sc->frameTimestampsEverRetrieved.load(std::memory_order_relaxed) &&
+                 sc->presentCount.load(std::memory_order_relaxed) >= 3)) {
+                LOG(WARNING) << "eglGetFrameTimestampsANDROID failed with error " << err
+                        << ". Disabling frame timestamps query.";
+                sc->frameTimestampsSupported.store(false, std::memory_order_relaxed);
+            }
             return false;
         }
+        sc->frameTimestampsEverRetrieved.store(true, std::memory_order_relaxed);
         outFrameTimestamps->requestedPresentTime = values[0];
         outFrameTimestamps->acquireTime = values[1];
         outFrameTimestamps->latchTime = values[2];
@@ -419,12 +421,10 @@ Platform::SwapChain* PlatformEGLAndroid::createSwapChain(void* nativeWindow, uin
         EGLDisplay const dpy = getEglDisplay();
         sc->compositorTimingSupported =
                 eglGetCompositorTimingSupportedANDROID(dpy, sc->sur,
-                        EGL_COMPOSITE_DEADLINE_ANDROID) &&
-                eglGetCompositorTimingSupportedANDROID(dpy, sc->sur,
                         EGL_COMPOSITE_INTERVAL_ANDROID) &&
                 eglGetCompositorTimingSupportedANDROID(dpy, sc->sur,
                         EGL_COMPOSITE_TO_PRESENT_LATENCY_ANDROID);
-        sc->frameTimestampsSupported =
+        sc->frameTimestampsSupported.store(
                 eglGetFrameTimestampSupportedANDROID(dpy, sc->sur,
                         EGL_REQUESTED_PRESENT_TIME_ANDROID) &&
                 eglGetFrameTimestampSupportedANDROID(dpy, sc->sur,
@@ -442,12 +442,12 @@ Platform::SwapChain* PlatformEGLAndroid::createSwapChain(void* nativeWindow, uin
                 eglGetFrameTimestampSupportedANDROID(dpy, sc->sur,
                         EGL_DEQUEUE_READY_TIME_ANDROID) &&
                 eglGetFrameTimestampSupportedANDROID(dpy, sc->sur,
-                        EGL_READS_DONE_TIME_ANDROID);
+                        EGL_READS_DONE_TIME_ANDROID), std::memory_order_relaxed);
     }
     // This is expected to be a low frequency log, only turned on in debug builds
     DLOG(INFO) << "anw: " << nativeWindow
             << ", compositorTimingSupported=" << sc->compositorTimingSupported
-            << ", frameTimestampsSupported=" << sc->frameTimestampsSupported;
+            << ", frameTimestampsSupported=" << sc->frameTimestampsSupported.load(std::memory_order_relaxed);
     return sc;
 }
 
@@ -480,6 +480,19 @@ Platform::ExternalImageHandle PlatformEGLAndroid::createExternalImage(
         AHardwareBuffer_describe(hardwareBuffer, &hardwareBufferDescription);
         p->height = hardwareBufferDescription.height;
         p->width = hardwareBufferDescription.width;
+
+        // A complete chain runs down to 1x1: floor(log2(max(w,h))) + 1 levels.
+        // ilogbf() reads the float exponent directly, so it is exact; floor(log2(...)) would
+        // depend on log2() being correctly rounded, which is not guaranteed (e.g. log2(1024.0f)
+        // may compute as 9.9999999f, yielding one level too few). Mirrors
+        // FTexture::maxLevelCount().
+        if (hardwareBufferDescription.usage & AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE) {
+            uint32_t const maxDimension = std::max(p->width, p->height);
+            p->mipLevels = uint8_t(std::max(1, std::ilogbf(float(maxDimension)) + 1));
+        } else {
+            p->mipLevels = 1;
+        }
+
         auto const textureFormat = mapToFilamentFormat(hardwareBufferDescription.format, sRGB);
         // Only set sRGB as true if the filament format requires it, otherwise the eglCreateImage might fail.
         p->sRGB = textureFormat == TextureFormat::SRGB8 || textureFormat == TextureFormat::SRGB8_A8;
@@ -504,6 +517,22 @@ PlatformEGLAndroid::ExternalImageDescAndroid PlatformEGLAndroid::getExternalImag
     metadata.format = eglExternalImage->format;
     metadata.usage = eglExternalImage->usage;
     return metadata;
+}
+
+uint8_t PlatformEGLAndroid::getExternalImageMipLevels(
+        ExternalImageHandleRef externalImage) const noexcept {
+    // Importing a full mip chain requires glEGLImageTargetTexStorageEXT. Check the extension
+    // string as well as the entry point, because eglGetProcAddress() may return a non-null
+    // pointer for a function the driver doesn't actually support.
+    // Note: PlatformEGLAndroid declares its own `ext`, which hides PlatformEGL's, so the base
+    // class member has to be named explicitly here.
+    if (!PlatformEGL::ext.gl.EXT_EGL_image_storage ||
+            glEGLImageTargetTexStorageEXT == nullptr) {
+        return 1;
+    }
+    auto const* const img =
+            static_cast<ExternalImageEGLAndroid const*>(externalImage.get());
+    return img ? img->mipLevels : 1;
 }
 
 bool PlatformEGLAndroid::setExternalImage(ExternalImageHandleRef externalImage,
@@ -580,10 +609,27 @@ bool PlatformEGLAndroid::setImage(ExternalImageEGLAndroid const* eglExternalImag
         glBindTexture(GL_TEXTURE_2D, prevTexture);
         return false;
     }
-    glEGLImageTargetTexture2DOES(texture->target, static_cast<GLeglImageOES>(eglImage));
+    // Use the level count the driver sized the texture for -- it is the only decision maker,
+    // so the imported levels and the texture's GL_TEXTURE_MAX_LEVEL can never disagree. It is
+    // > 1 only if getExternalImageMipLevels() reported a chain, which requires the extension.
+    bool const mipmapped = texture->levels > 1;
+    if (mipmapped) {
+        // mipmapped external textures cannot use GL_TEXTURE_EXTERNAL_OES, the driver only
+        // reports levels > 1 for a GL_TEXTURE_2D import.
+        assert_invariant(texture->target == GL_TEXTURE_2D);
+        // glEGLImageTargetTexStorageEXT establishes immutable storage covering the entire mip
+        // chain present in the EGLImage in a single call.
+        glEGLImageTargetTexStorageEXT(texture->target, static_cast<GLeglImageOES>(eglImage),
+                /*attrib_list=*/nullptr);
+    } else {
+        glEGLImageTargetTexture2DOES(texture->target, static_cast<GLeglImageOES>(eglImage));
+    }
     error = glGetError();
     if (UTILS_UNLIKELY(error != GL_NO_ERROR)) {
-        LOG(ERROR) << "Error after glEGLImageTargetTexture2DOES: " << error;
+        LOG(ERROR) << "Error after "
+                   << (mipmapped ? "glEGLImageTargetTexStorageEXT"
+                                 : "glEGLImageTargetTexture2DOES")
+                   << ": " << error;
         glDeleteTextures(1, &texture->id);
         eglDestroyImageKHR(eglGetCurrentDisplay(), eglImage);
         glActiveTexture(prevActiveTexture);
@@ -636,7 +682,7 @@ Platform::Sync* PlatformEGLAndroid::createSync() noexcept {
     } else {
         LOG(WARNING) << "Native fences not supported on this device.";
     }
-    return new(std::nothrow) SyncEGLAndroid{ .sync = sync };
+    return new(std::nothrow) SyncEGLAndroid(sync);
 }
 
 bool PlatformEGLAndroid::convertSyncToFd(Sync* sync, int* fd) noexcept {
@@ -671,7 +717,11 @@ void PlatformEGLAndroid::destroySync(Sync* sync) noexcept {
             eglDestroySyncKHR(getEglDisplay(), eglSync.sync);
         }
     }
-    delete sync;
+
+    // Cast to SyncEGLAndroid, as Platform::Sync does not have a virtual
+    // destructor, and therefore, it is undefined behavior to delete
+    // the base class.
+    delete static_cast<SyncEGLAndroid*>(sync);
 }
 
 void PlatformEGLAndroid::attach(Stream* stream, intptr_t const tname) noexcept {
@@ -750,12 +800,27 @@ AcquiredImage PlatformEGLAndroid::transformAcquiredImage(AcquiredImage const sou
 
 
 bool PlatformEGLAndroid::isProducerThrottlingControlSupported() const {
-    return mAndroidDetails.producerThrottling.isSupported();
+    return NativeWindow::isProducerThrottlingSupported();
 }
 
 int32_t PlatformEGLAndroid::setProducerThrottlingEnabled(
-    EGLNativeWindowType const nativeWindow, bool const enabled) const {
-    return mAndroidDetails.producerThrottling.setProducerThrottlingEnabled(nativeWindow, enabled);
+        EGLNativeWindowType const nativeWindow, bool const enabled) const {
+    return NativeWindow::setProducerThrottlingEnabled(
+            static_cast<ANativeWindow*>(nativeWindow), enabled);
+}
+utils::tribool PlatformEGLAndroid::isFrameRateChangeSupported(void* const nativeWindow) const noexcept {
+    return NativeWindow::isFrameRateChangeSupported(static_cast<ANativeWindow*>(nativeWindow));
+}
+
+int PlatformEGLAndroid::setFrameRate(SwapChain const* const swapchain, float const frameRate,
+        FrameRateCompatibility const compatibility,
+        ChangeFrameRateStrategy const strategy) noexcept {
+    auto const* const sc = static_cast<SwapChainEGLAndroid const*>(swapchain);
+    if (sc && sc->nativeWindow) {
+        return NativeWindow::setFrameRate(
+                static_cast<ANativeWindow*>(sc->nativeWindow), frameRate, compatibility, strategy);
+    }
+    return -ENOSYS;
 }
 
 // ---------------------------------------------------------------------------------------------

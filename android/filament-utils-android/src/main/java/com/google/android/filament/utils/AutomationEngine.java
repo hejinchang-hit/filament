@@ -54,6 +54,10 @@ public class AutomationEngine {
     private final long mNativeObject;
     private ColorGrading mColorGrading;
 
+    long getNativeObject() {
+        return mNativeObject;
+    }
+
     /**
      * Allows users to toggle screenshots, change the sleep duration between tests, etc.
      */
@@ -99,6 +103,7 @@ public class AutomationEngine {
         public boolean skyboxEnabled = true;
         public boolean autoScaleEnabled = true;
         public boolean autoInstancingEnabled = false;
+        public float cameraFrameRate = 0.0f;
     }
 
     public static class CameraSettings {
@@ -256,7 +261,7 @@ public class AutomationEngine {
         // so there is no need to call Engine#destroyColorGrading here.
         long nativeCg = nGetColorGrading(mNativeObject, engine.getNativeObject());
         if (mColorGrading == null || mColorGrading.getNativeObject() != nativeCg) {
-            mColorGrading = nativeCg == 0 ? null : new ColorGrading(nativeCg);
+            mColorGrading = nativeCg == 0 ? null : ColorGrading.wrap(nativeCg);
         }
         return mColorGrading;
     }

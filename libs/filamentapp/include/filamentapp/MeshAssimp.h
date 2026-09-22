@@ -26,25 +26,31 @@ namespace filament {
     class Renderable;
 }
 
-#include <unordered_map>
-#include <map>
-#include <vector>
+#include <filament/Box.h>
+#include <filament/Color.h>
+#include <filament/Texture.h>
+#include <filament/TextureSampler.h>
+#include <filament/TransformManager.h>
+
+#include <filamat/MaterialBuilder.h>
+
+#include <utils/EntityManager.h>
+#include <utils/Path.h>
 
 #include <math/mat3.h>
 #include <math/mat4.h>
 #include <math/quat.h>
 #include <math/vec3.h>
 
-#include <utils/EntityManager.h>
-#include <utils/Path.h>
-
-#include <filamat/MaterialBuilder.h>
-#include <filament/Color.h>
-#include <filament/Box.h>
-#include <filament/Texture.h>
-#include <filament/TextureSampler.h>
-#include <filament/TransformManager.h>
 #include <assimp/scene.h>
+
+#include <map>
+#include <unordered_map>
+#include <vector>
+
+namespace filament::app {
+class AssetLoader;
+}
 
 class MeshAssimp {
 public:
@@ -53,13 +59,13 @@ public:
     using short4 = filament::math::short4;
     using half2 = filament::math::half2;
     using ushort2 = filament::math::ushort2;
-    explicit MeshAssimp(filament::Engine& engine);
+    explicit MeshAssimp(filament::Engine& engine, filament::app::AssetLoader* loader = nullptr);
     ~MeshAssimp();
 
     // This function takes over the ownership of `materials` to prevent crashes due to the
     // incorrect order of resource destruction.
     void addFromFile(const utils::Path& path,
-            std::map<std::string, filament::MaterialInstance*>& materials,
+            std::map<utils::CString, filament::MaterialInstance*>& materials,
             bool overrideMaterial = false);
 
     const std::vector<utils::Entity> getRenderables() const noexcept {
@@ -105,22 +111,19 @@ private:
         std::vector<int> parents;
     };
 
-    bool setFromFile(Asset& asset, std::map<std::string, filament::MaterialInstance*>& outMaterials);
+    bool setFromBuffer(Asset& asset,
+            std::map<utils::CString, filament::MaterialInstance*>& outMaterials,
+            const uint8_t* buffer, size_t length);
 
     void processGLTFMaterial(const aiScene* scene, const aiMaterial* material,
             const std::string& materialName, const std::string& dirName,
-            std::map<std::string, filament::MaterialInstance*>& outMaterials) const;
+            std::map<utils::CString, filament::MaterialInstance*>& outMaterials) const;
 
     template<bool SNORMUV0S, bool SNORMUV1S>
     void processNode(Asset& asset,
-                     std::map<std::string, filament::MaterialInstance*>& outMaterials,
-                     const aiScene *scene,
-                     bool isGLTF,
-                     size_t deep,
-                     size_t matCount,
-                     const aiNode *node,
-                     int parentIndex,
-                     size_t &depth) const;
+            std::map<utils::CString, filament::MaterialInstance*>& outMaterials,
+            const aiScene* scene, bool isGLTF, size_t deep, size_t matCount, const aiNode* node,
+            int parentIndex, size_t& depth) const;
 
     filament::Texture* createOneByOneTexture(uint32_t textureData);
     filament::Engine& mEngine;
@@ -130,7 +133,7 @@ private:
     filament::Material* mDefaultColorMaterial = nullptr;
     filament::Material* mDefaultTransparentColorMaterial = nullptr;
     mutable std::unordered_map<uint64_t, filament::Material*> mGltfMaterialCache;
-    std::map<std::string, filament::MaterialInstance*> mMaterialInstances;
+    std::map<utils::CString, filament::MaterialInstance*> mMaterialInstances;
 
     filament::Texture* mDefaultMap = nullptr;
     filament::Texture* mDefaultNormalMap = nullptr;
@@ -141,6 +144,9 @@ private:
     std::vector<utils::Entity> mRenderables;
 
     std::vector<filament::Texture*> mTextures;
+
+    filament::app::AssetLoader* mAssetLoader = nullptr;
+    bool mAllocatedAssetLoader = false;
 };
 
 #endif // TNT_FILAMENT_SAMPLE_MESH_ASSIMP_H

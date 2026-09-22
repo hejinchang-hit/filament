@@ -16,23 +16,26 @@
 
 #include "details/RenderTarget.h"
 
+#include "FilamentAPI-impl.h"
+
 #include "details/Engine.h"
 #include "details/Texture.h"
 
-#include "FilamentAPI-impl.h"
-
+#include <filament/Engine.h>
 #include <filament/RenderTarget.h>
 
-#include <utils/compiler.h>
+#include <backend/DriverEnums.h>
+
 #include <utils/BitmaskEnum.h>
+#include <utils/compiler.h>
 #include <utils/Panic.h>
 
 #include <algorithm>
 #include <iterator>
 #include <limits>
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 
 namespace filament {
@@ -150,6 +153,19 @@ RenderTarget* RenderTarget::Builder::build(Engine& engine) {
         // to the number of layerCount for multiview.
         mImpl->mLayerCount = minLayerCount;
     }
+
+    // OpenGL bakes `layout(num_views = N)` into the GLSL from Engine::Config::stereoscopicEyeCount,
+    // and OVR_multiview requires N to equal the framebuffer's view count at draw time.
+    // Otherwise the draw silently fails with GL_INVALID_OPERATION, so reject the mismatch here.
+    Engine::Config const& config = downcast(engine).getConfig();
+    if (mImpl->mLayerCount > 1 && downcast(engine).getBackend() == Backend::OPENGL &&
+            config.stereoscopicType == Engine::StereoscopicType::MULTIVIEW) {
+        FILAMENT_CHECK_PRECONDITION(mImpl->mLayerCount == config.stereoscopicEyeCount)
+                << "layerCount (" << mImpl->mLayerCount
+                << ") must match Engine::Config::stereoscopicEyeCount ("
+                << config.stereoscopicEyeCount << ") when using multiview on the OpenGL backend";
+    }
+
     return downcast(engine).createRenderTarget(*this);
 }
 

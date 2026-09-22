@@ -18,6 +18,7 @@
 
 #include "VulkanConstants.h"
 #include "VulkanHandles.h"
+
 #include "vulkan/utils/Image.h"
 
 #include <utils/compiler.h>
@@ -104,7 +105,7 @@ fvkmemory::resource_ptr<VulkanFramebuffer> VulkanFboCache::getFramebuffer(FboKey
     FVK_LOGD << "Creating framebuffer " << config.width << "x" << config.height << " "
         << "for render pass " << config.renderPass << ", "
         << "samples = " << int(config.samples) << ", "
-        << "depth = " << (config.depth ? 1 : 0) << ", "
+        << "depth = " << (config.depthStencil ? 1 : 0) << ", "
         << "attachmentCount = " << attachmentCount;
     #endif
 
@@ -153,8 +154,9 @@ fvkmemory::resource_ptr<VulkanRenderPass> VulkanFboCache::getRenderPass(
     VkAttachmentReference resolveAttachmentRef[MRT::MAX_SUPPORTED_RENDER_TARGET_COUNT] = {};
     VkAttachmentReference depthStencilAttachmentRef = {};
 
-    const bool hasDepthOrStencil = fvkutils::isVkDepthFormat(config.depthStencilFormat) ||
-                                   fvkutils::isVkStencilFormat(config.depthStencilFormat);
+    const bool hasDepth = fvkutils::isVkDepthFormat(config.depthStencilFormat);
+    const bool hasStencil = fvkutils::isVkStencilFormat(config.depthStencilFormat);
+    const bool hasDepthOrStencil = hasDepth || hasStencil;
 
     VkSubpassDescription subpasses[2] = {{
         .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -257,19 +259,21 @@ fvkmemory::resource_ptr<VulkanRenderPass> VulkanFboCache::getRenderPass(
             colorAttachmentRefs[1][index].attachment = attachmentIndex;
         }
 
-        const TargetBufferFlags flag = TargetBufferFlags(int(TargetBufferFlags::COLOR0) << i);
-        const bool clear = any(config.clear & flag);
-        const bool discard = any(config.discardStart & flag);
+        TargetBufferFlags const flag = TargetBufferFlags(int(TargetBufferFlags::COLOR0) << i);
+        bool const clear = any(config.clear & flag);
+        bool const discardStart = any(config.discardStart & flag);
+        bool const discardEnd = any(config.discardEnd & flag);
 
         attachments[attachmentIndex++] = {
             .format = config.colorFormat[i],
             .samples = (VkSampleCountFlagBits) config.samples,
-            .loadOp = clear ? kClear : (discard ? kDontCare : kKeep),
-            .storeOp = (config.usesLazilyAllocatedMemory & (1 << i)) ? kDisableStore : kEnableStore,
+            .loadOp = clear ? kClear : (discardStart ? kDontCare : kKeep),
+            .storeOp = (discardEnd || (config.usesLazilyAllocatedMemory & (1 << i))) ? kDisableStore
+                                                                                     : kEnableStore,
             .stencilLoadOp = kDontCare,
             .stencilStoreOp = kDisableStore,
             .initialLayout = fvkutils::getVkLayout(VulkanLayout::COLOR_ATTACHMENT),
-            .finalLayout = fvkutils::getVkLayout(FINAL_COLOR_ATTACHMENT_LAYOUT),
+            .finalLayout = fvkutils::getVkLayout(VulkanLayout::COLOR_ATTACHMENT),
         };
     }
 
@@ -307,7 +311,7 @@ fvkmemory::resource_ptr<VulkanRenderPass> VulkanFboCache::getRenderPass(
             .stencilLoadOp = kDontCare,
             .stencilStoreOp = kDisableStore,
             .initialLayout = fvkutils::getVkLayout(VulkanLayout::COLOR_ATTACHMENT),
-            .finalLayout = fvkutils::getVkLayout(FINAL_COLOR_ATTACHMENT_LAYOUT),
+            .finalLayout = fvkutils::getVkLayout(VulkanLayout::COLOR_ATTACHMENT),
         };
     }
 
@@ -325,12 +329,12 @@ fvkmemory::resource_ptr<VulkanRenderPass> VulkanFboCache::getRenderPass(
         attachments[attachmentIndex++] = {
             .format = config.depthStencilFormat,
             .samples = (VkSampleCountFlagBits) config.samples,
-            .loadOp = clearDepth ? kClear : (discardStartDepth ? kDontCare : kKeep),
-            .storeOp = discardEndDepth ? kDisableStore : kEnableStore,
-            .stencilLoadOp = clearStencil ? kClear : (discardStartStencil ? kDontCare : kKeep),
-            .stencilStoreOp = discardEndStencil ? kDisableStore : kEnableStore,
+            .loadOp = hasDepth ? (clearDepth ? kClear : (discardStartDepth ? kDontCare : kKeep)) : kDontCare,
+            .storeOp = hasDepth ? (discardEndDepth ? kDisableStore : kEnableStore) : kDisableStore,
+            .stencilLoadOp = hasStencil ? (clearStencil ? kClear : (discardStartStencil ? kDontCare : kKeep)) : kDontCare,
+            .stencilStoreOp = hasStencil ? (discardEndStencil ? kDisableStore : kEnableStore) : kDisableStore,
             .initialLayout = fvkutils::getVkLayout(config.initialDepthStencilLayout),
-            .finalLayout = fvkutils::getVkLayout(FINAL_DEPTH_STENCIL_ATTACHMENT_LAYOUT),
+            .finalLayout = fvkutils::getVkLayout(VulkanLayout::DEPTH_STENCIL_ATTACHMENT),
         };
     }
     renderPassInfo.attachmentCount = attachmentIndex;
@@ -350,8 +354,8 @@ fvkmemory::resource_ptr<VulkanRenderPass> VulkanFboCache::getRenderPass(
         FVK_LOGD << (int) config.colorFormat[i] << " ";
     }
     FVK_LOGD << ", "
-             << "depth = " << config.depthFormat << ", "
-             << "initialDepthLayout = " << (int) config.initialDepthLayout << ", "
+             << "depth = " << config.depthStencilFormat << ", "
+             << "initialDepthLayout = " << (int) config.initialDepthStencilLayout << ", "
              << "samples = " << int(config.samples) << ", "
              << "needsResolveMask = " << int(config.needsResolveMask) << ", "
              << "usesLazilyAllocatedMemory = " << int(config.usesLazilyAllocatedMemory) << ", "

@@ -26,7 +26,6 @@
 
 #include "details/Engine.h"
 #include "details/Fence.h"
-#include "details/Material.h"
 #include "details/MaterialInstance.h"
 #include "details/Scene.h"
 #include "details/SwapChain.h"
@@ -42,44 +41,45 @@
 #include <private/filament/EngineEnums.h>
 #include <private/filament/Variant.h>
 
-#include <private/utils/Tracing.h>
-
 #include <filament/Camera.h>
 #include <filament/Fence.h>
+#include <filament/FrameHistoryStream.h>
 #include <filament/Options.h>
 #include <filament/Renderer.h>
 
-#include <backend/DriverEnums.h>
 #include <backend/DriverApiForward.h>
+#include <backend/DriverEnums.h>
 #include <backend/Handle.h>
 #include <backend/PixelBufferDescriptor.h>
 
-#include <math/vec2.h>
-#include <math/vec3.h>
-#include <math/mat4.h>
+#include <private/utils/Tracing.h>
 
-#include <utils/architecture.h>
 #include <utils/Allocator.h>
+#include <utils/architecture.h>
 #include <utils/bitset.h>
+#include <utils/compiler.h>
+#include <utils/debug.h>
 #include <utils/JobSystem.h>
 #include <utils/Logger.h>
 #include <utils/Panic.h>
-#include <utils/compiler.h>
-#include <utils/debug.h>
+
+#include <math/mat4.h>
+#include <math/vec2.h>
+#include <math/vec3.h>
 
 #include <algorithm>
-#include <cmath>
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <utility>
-
-#include <stddef.h>
-#include <stdint.h>
 
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
+
+#include <stddef.h>
+#include <stdint.h>
 
 // this helps visualize what dynamic-scaling is doing
 #define DEBUG_DYNAMIC_SCALING false
@@ -96,6 +96,9 @@ FRenderer::FRenderer(FEngine& engine) :
         mFrameSkipper(),
         mRenderTargetHandle(engine.getDefaultRenderTarget()),
         mFrameInfoManager(engine, engine.getDriverApi()),
+#if FILAMENT_LOG_FRAME_INFO
+        mFrameHistoryStream(this),
+#endif
         mHdrTranslucent(TextureFormat::RGBA16F),
         mHdrQualityMedium(TextureFormat::R11F_G11F_B10F),
         mHdrQualityHigh(TextureFormat::RGB16F),
@@ -200,8 +203,18 @@ void FRenderer::terminate(FEngine& engine) {
     mResourceAllocator->terminate();
 }
 
-void FRenderer::resetUserTime() {
-    mUserEpoch = std::chrono::steady_clock::now();
+void FRenderer::setMaterialTimeEpoch(int64_t const monotonic_clock_ns) {
+    setMaterialTimeEpoch(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(monotonic_clock_ns)));
+}
+
+void FRenderer::setMaterialTimeEpoch(std::chrono::steady_clock::time_point const monotonic_clock) {
+    mUserEpoch = monotonic_clock;
+}
+
+void FRenderer::pauseRenderThread(uint64_t const duration_ns) {
+    mEngine.getDriverApi().queueCommand([duration_ns]() {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(duration_ns));
+    });
 }
 
 TextureFormat FRenderer::getHdrFormat(const FView& view, bool const translucent) const noexcept {
@@ -253,9 +266,34 @@ void FRenderer::initializeClearFlags() noexcept {
     mClearFlags = getClearFlags();
 }
 
-void FRenderer::setPresentationTime(int64_t const monotonic_clock_ns) const {
-    FEngine::DriverApi& driver = mEngine.getDriverApi();
-    driver.setPresentationTime(monotonic_clock_ns);
+void FRenderer::setPresentationTime(int64_t const monotonic_clock_ns) noexcept {
+    using namespace std::chrono;
+    mPresentationTime = steady_clock::time_point(nanoseconds(monotonic_clock_ns));
+}
+
+void FRenderer::setPresentationTime(std::chrono::steady_clock::time_point const monotonic_clock) noexcept {
+    mPresentationTime = monotonic_clock;
+}
+
+void FRenderer::setDesiredPresentationTime(int64_t const monotonic_clock_ns) noexcept {
+    using namespace std::chrono;
+    mDesiredPresentationTime = steady_clock::time_point(nanoseconds(monotonic_clock_ns));
+}
+
+void FRenderer::setDesiredPresentationTime(std::chrono::steady_clock::time_point const monotonic_clock) noexcept {
+    mDesiredPresentationTime = monotonic_clock;
+}
+
+void FRenderer::setRenderingDeadline(int64_t const monotonic_clock_ns) noexcept {
+    setRenderingDeadline(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(monotonic_clock_ns)));
+}
+
+void FRenderer::setRenderingDeadline(std::chrono::steady_clock::time_point const monotonic_clock) noexcept {
+    mRenderingDeadline = monotonic_clock;
+}
+
+void FRenderer::setFrameScheduleTime(std::chrono::steady_clock::time_point const time) noexcept {
+    mFrameScheduleTime = time;
 }
 
 void FRenderer::setVsyncTime(uint64_t const steadyClockTimeNano) noexcept {
@@ -281,14 +319,13 @@ std::pair<float, float2> FRenderer::prepareUpscaler(float2 const scale,
     return { bias, derivativesScale };
 }
 
-void FRenderer::skipFrame(uint64_t vsyncSteadyClockTimeNano) {
+void FRenderer::skipFrame(uint64_t const vsyncSteadyClockTimeNano) {
     FILAMENT_TRACING_CALL(FILAMENT_TRACING_CATEGORY_FILAMENT);
 
     FILAMENT_CHECK_PRECONDITION(!mSwapChain) <<
             "skipFrame() can't be called between beginFrame() and endFrame()";
 
     if (!vsyncSteadyClockTimeNano) {
-        vsyncSteadyClockTimeNano = mVsyncSteadyClockTimeNano;
         mVsyncSteadyClockTimeNano = 0;
     }
 
@@ -315,6 +352,15 @@ void FRenderer::skipFrame(uint64_t vsyncSteadyClockTimeNano) {
     mFrameSkipper.frameSkipped();
 }
 
+bool FRenderer::hasGpuFallenBehind() const noexcept {
+    if (UTILS_VERY_UNLIKELY(mEngine.hasExceptionBeenRethrown())) {
+        return false;
+    }
+    FEngine& engine = mEngine;
+    FEngine::DriverApi& driver = engine.getDriverApi();
+    return !mFrameSkipper.shouldRenderFrame(driver);
+}
+
 bool FRenderer::shouldRenderFrame() const noexcept {
     if (UTILS_VERY_UNLIKELY(mEngine.hasExceptionBeenRethrown())) {
         return false;
@@ -323,45 +369,10 @@ bool FRenderer::shouldRenderFrame() const noexcept {
     FEngine::DriverApi& driver = engine.getDriverApi();
     bool const renderFrame = mFrameSkipper.shouldRenderFrame(driver);
     if (renderFrame && engine.features.engine.skip_frame_when_cpu_ahead_of_display) {
-        // see if we have another reason to skip
-        auto history = mFrameInfoManager.getFrameInfoHistory();
-        for (size_t i = 0, c = history.size(); i < c; i++) {
-            FrameInfo const& info = history[i];
-            if (int32_t(info.frameId - mLastFrameId) <= 0) {
-                continue;
-            }
-            if (info.expectedPresentLatency < 0 || info.displayPresent < 0) {
-                continue;
-            }
-
-            // this frame's presentation latency (time from vsync to display)
-            auto const presentLatency = info.displayPresent - info.vsync;
-
-            // The maximum latency we allow. we choose the expected presentation latency + one whole frame, this
-            // is because be default the expected presentation latency is the shorted possible, and is usually almost
-            // impossible to achieve, so we aim for an extra frame. The system is typically configured to allow this
-            // (on Android), i.e. it has enough intermediary buffers.
-            // TODO: the "expectedPresentLatency" should come from the user, and if they use the choreographer APIs
-            //       on Android, it will be set to that. Of course, we need an abstraction. This code assumes
-            //       the caller selected the default timeline.
-            auto const maximumLatencyAllowed = info.expectedPresentLatency + info.displayPresentInterval;
-
-            // if we took a whole extra frame more than the maximum latency allowed, we need to skip a frame.
-            // we use a whole frame because in practice the presentLatency will straddle around the
-            // maximumLatency, and the latency "unit" is displayPresentInterval.
-            if (presentLatency - maximumLatencyAllowed >= info.displayPresentInterval) {
-                // Keep for debugging
-                // LOG(INFO) << "skip frame " << mFrameId
-                //     << " because of frame " << info.frameId << " (" << (info.frameId - mFrameId) << ")"
-                //     << ", displayPresentInterval=" << info.displayPresentInterval
-                //     << ", expectedPresentLatency=" << info.expectedPresentLatency
-                //     << ", maximumLatencyAllowed=" << maximumLatencyAllowed
-                //     << ", latency=" << presentLatency
-                //     << ", missed=" << presentLatency - maximumLatencyAllowed
-                //     ;
-                return false;
-            }
-            break;
+        auto history = mFrameInfoManager.getFrameInfoHistorySlice();
+        if (mBufferStuffingDetector.shouldSkipFrame(history, mLastSubmittedFrameId)) {
+            DLOG(INFO) << "skip frame " << mFrameId << " because of buffer stuffing";
+            return false;
         }
     }
     return renderFrame;
@@ -375,6 +386,30 @@ bool FRenderer::beginFrame(FSwapChain* swapChain, uint64_t vsyncSteadyClockTimeN
     if (UTILS_VERY_UNLIKELY(mEngine.hasExceptionBeenRethrown())) {
         return false;
     }
+
+#if FILAMENT_LOG_FRAME_INFO
+    for (auto fi : mFrameHistoryStream.getNewFrames()) {
+        if (fi) {
+            LOG(INFO)
+                    << fi->frameId << ", "
+                    << fi->vsync << ", "
+                    << fi->displayPresentInterval << ", "
+                    << fi->gpuFrameDuration << ", "
+                    << (fi->frameScheduleTime - fi->vsync) << ", "
+                    << (fi->beginFrame - fi->vsync) << ", "
+                    << (fi->endFrame - fi->vsync) << ", "
+                    << (fi->backendBeginFrame - fi->vsync) << ", "
+                    << (fi->backendEndFrame - fi->vsync) << ", "
+                    << (fi->gpuFrameComplete - fi->vsync) << ", "
+                    << ((fi->displayPresent > 0) ? (fi->displayPresent - fi->vsync) : -1) << ", "
+                    << ((fi->presentDeadline > 0) ? (fi->presentDeadline - fi->vsync) : -1) << ", "
+                    << ((fi->expectedPresentLatency > 0) ? (fi->expectedPresentLatency) : -1)
+                    ;
+        } else {
+            LOG(INFO) << fi.getMissingId();
+        }
+    }
+#endif
 
     mEngine.propagateBackendException();
 
@@ -399,12 +434,6 @@ bool FRenderer::beginFrame(FSwapChain* swapChain, uint64_t vsyncSteadyClockTimeN
     if (UTILS_UNLIKELY(engine.debug.renderer.doFrameCapture)) {
         driver.startCapture();
     }
-
-    // latch the frame time
-    std::chrono::duration<double> const time(appVsync - mUserEpoch);
-    float const h = float(time.count());
-    float const l = float(time.count() - h);
-    mShaderUserTime = { h, l, 0, 0 };
 
     mPreviousRenderTargets.clear();
 
@@ -439,19 +468,42 @@ bool FRenderer::beginFrame(FSwapChain* swapChain, uint64_t vsyncSteadyClockTimeN
                         1'000'000'000.0 / mDisplayInfo.refreshRate),
                 mFrameId);
 
+        auto const presentationTime = mPresentationTime;
+        auto const desiredPresentationTime = mDesiredPresentationTime;
+        auto const renderingDeadline = mRenderingDeadline;
+        mPresentationTime = {};
+        mDesiredPresentationTime = {};
+        mRenderingDeadline = {};
+
+        if (presentationTime.time_since_epoch().count()) {
+            driver.setPresentationTime(std::chrono::duration_cast<nanoseconds>(
+                    presentationTime.time_since_epoch()).count());
+        }
+
+        auto const shaderTimePoint = desiredPresentationTime.time_since_epoch().count() > 0 ?
+                desiredPresentationTime : appVsync;
+        std::chrono::duration<double> const time(shaderTimePoint - mUserEpoch);
+        float const h = float(time.count());
+        float const l = float(time.count() - h);
+        mShaderUserTime = { h, l, 0, 0 };
+
         // This need to occur after the backend beginFrame() because some backends need to start
         // a command buffer before creating a fence.
 
         mFrameInfoManager.updateUserHistory(swapChain, driver);
         mFrameInfoManager.beginFrame(swapChain, driver, {
             .historySize = mFrameRateOptions.history
-        }, mFrameId, appVsync);
+        }, mFrameId, appVsync, renderingDeadline, desiredPresentationTime, mFrameScheduleTime);
+        mFrameScheduleTime = {};
+
+        mLastSubmittedFrameId = mFrameId;
 
         // ask the engine to do what it needs to (e.g. updates light buffer, materials...)
         engine.prepare(driver);
     };
 
-    if (shouldRenderFrame()) {
+    bool const isPacedMode = mPresentationTime.time_since_epoch().count() != 0;
+    if (isPacedMode || shouldRenderFrame()) {
         // if beginFrame() returns true, we are expecting a call to endFrame(),
         // so do the beginFrame work right now, instead of requiring a call to render()
         beginFrameInternal();
@@ -470,7 +522,7 @@ bool FRenderer::beginFrame(FSwapChain* swapChain, uint64_t vsyncSteadyClockTimeN
     engine.flush();
 
     // we cannot detect more until we reach at least this frame
-    mLastFrameId = mFrameId;
+    mBufferStuffingDetector.setLastFrameId(mLastSubmittedFrameId);
     mFrameSkipper.frameSkipped();
     return false;
 }
@@ -574,7 +626,7 @@ void FRenderer::copyFrame(FSwapChain* dstSwapChain, filament::Viewport const& ds
     // Clear color to black if the CLEAR flag is set.
     if (flags & CLEAR) {
         RenderPassParams params = {};
-        params.clearColor = {0.f, 0.f, 0.f, 1.f};
+        params.clearColor = ClearColorValue{ 0.f, 0.f, 0.f, 1.f };
         params.flags.clear = TargetBufferFlags::COLOR;
         params.flags.discardStart = TargetBufferFlags::ALL;
         params.flags.discardEnd = TargetBufferFlags::NONE;
@@ -665,22 +717,23 @@ void FRenderer::render(FView const* view) {
     }
 }
 
-void FRenderer::renderInternal(DriverApi& driver, FView const* view, bool flush) {
+void FRenderer::renderInternal(DriverApi& driver, FView const* view, bool const flush) {
     FEngine& engine = mEngine;
 
     FILAMENT_CHECK_PRECONDITION(!view->hasPostProcessPass() ||
-                                engine.hasFeatureLevel(FeatureLevel::FEATURE_LEVEL_1))
+            engine.hasFeatureLevel(FeatureLevel::FEATURE_LEVEL_1))
                     << "post-processing is not supported at FEATURE_LEVEL_0";
 
     // per-renderpass data
-    RootArenaScope rootArenaScope(engine.getPerRenderPassArena());
+    auto& arena = engine.getPerRenderPassArena();
+    ArenaScope const scope(arena);
 
     // create a root job so no other job can escape
     JobSystem& js = engine.getJobSystem();
     auto *rootJob = js.setRootJob(js.createJob());
 
     // execute the render pass
-    renderJob(driver, rootArenaScope, const_cast<FView&>(*view));
+    renderJob(driver, arena, const_cast<FView&>(*view));
 
     if (flush) {
         driver.flush();
@@ -693,7 +746,7 @@ void FRenderer::renderInternal(DriverApi& driver, FView const* view, bool flush)
     js.runAndWait(rootJob);
 }
 
-void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FView& view) {
+void FRenderer::renderJob(DriverApi& driver, LinearAllocatorArena& arena, FView& view) {
     FEngine& engine = mEngine;
     JobSystem& js = engine.getJobSystem();
     PostProcessManager& ppm = engine.getPostProcessManager();
@@ -895,7 +948,8 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
     /*
      * Frame graph
      */
-    FrameGraph fg(*mResourceAllocator,
+    FrameGraph fg(arena, FRAMEGRAPH_ARENA_SIZE,
+        *mResourceAllocator,
         isProtectedContent ? FrameGraph::Mode::PROTECTED : FrameGraph::Mode::UNPROTECTED);
 
 #if FILAMENT_ENABLE_FGVIEWER
@@ -917,7 +971,7 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
      */
 
     auto [bias, derivativeScale] = prepareUpscaler(scale, taaOptions, dsrOptions);
-    view.prepare(engine, driver, rootArenaScope, svp, taaCameraInfo, getShaderUserTime(), needsAlphaChannel);
+    view.prepare(engine, driver, arena, svp, taaCameraInfo, getShaderUserTime(), needsAlphaChannel);
     view.prepareLodBias(bias, derivativeScale);
     view.prepareSSAO(aoOptions);
     view.prepareSSR(engine, cameraInfo, ssrConfig.lodOffset, ssReflectionsOptions);
@@ -955,12 +1009,10 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
      * Allocate command buffer
      */
 
-    FScene& scene = *view.getScene();
-
     // Allocate some space for our commands in the per-frame Arena, and use that space as
     // an Arena for commands. All this space is released when we exit this method.
     size_t const perFrameCommandsSize = engine.getPerFrameCommandsSize();
-    void* const arenaBegin = rootArenaScope.allocate(perFrameCommandsSize, CACHELINE_SIZE);
+    void* const arenaBegin = arena.alloc(perFrameCommandsSize, CACHELINE_SIZE);
     void* const arenaEnd = pointermath::add(arenaBegin, perFrameCommandsSize);
 
     // This arena *must* stay valid until all commands have been processed
@@ -973,9 +1025,14 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
     RenderPassBuilder passBuilder(commandArena);
     passBuilder.renderFlags(renderFlags);
 
+    DynamicSpecConstKey specKey{0};
+    specKey.setDynamicLighting(view.hasDynamicLighting());
+    specKey.setExtraDirectionalLights(view.hasExtraDirectionalLights());
+    specKey.setDirectionalLighting(view.hasDirectionalLighting());
+    passBuilder.dynamicSpecConstKey(specKey);
+
     Variant variant;
-    variant.setDirectionalLighting(view.hasDirectionalLighting());
-    variant.setDynamicLighting(view.hasDynamicLighting());
+    variant.setDirectionalLighting(false);
     variant.setFog(view.hasFog());
     variant.setShadowSampler2D(view.hasShadowing() && view.getShadowType() != ShadowType::PCF);
     variant.setStereo(view.hasStereo());
@@ -986,9 +1043,9 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
 
     if (view.needsShadowMap()) {
         Variant shadowVariant(Variant::DEPTH_VARIANT);
-        shadowVariant.setDepthMoments(view.getShadowType() == ShadowType::VSM);
+        shadowVariant.setDepthMoments(view.hasVSM() || view.hasPCSS());
 
-        auto shadows = view.renderShadowMaps(engine, fg, cameraInfo, mShaderUserTime,
+        auto shadows = view.renderShadowMaps(engine, fg, cameraInfo, getShaderUserTime(),
                 RenderPassBuilder{ commandArena }
                     .renderFlags(renderFlags)
                     .variant(shadowVariant));
@@ -1011,7 +1068,7 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
     //        into a temporary buffer (common case), the clearColor is color-graded. A problem
     //        arises when transparent views are used, in this case the clear color is not
     //        color-graded.
-    const float4 clearColor = mClearOptions.clearColor;
+    const ClearColorValue clearColor = mClearOptions.clearColor;
 
     const uint8_t clearStencil = mClearOptions.clearStencil;
     const TargetBufferFlags clearFlags = mClearFlags;
@@ -1061,7 +1118,7 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
             .clearFlags = getClearFlags(),
             .clearColor = clearColor,
             .clearStencil = clearStencil,
-            .hasContactShadows = scene.hasContactShadows(),
+            .hasContactShadows = view.hasContactShadows(),
             // at this point we don't know if we have refraction, but that's handled later
             .hasScreenSpaceReflectionsOrRefractions = ssReflectionsOptions.enabled,
             .enabledStencilBuffer = view.isStencilBufferEnabled(),
@@ -1076,11 +1133,11 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
 
     // updatePrimitivesLod must be run before appendCommands and once for each set
     // of RenderPass::setCamera / RenderPass::setGeometry calls.
-    FView::updatePrimitivesLod(scene.getRenderableData(),
+    FView::updatePrimitivesLod(view.getRenderableData(),
             engine, cameraInfo, view.getVisibleRenderables());
 
     passBuilder.camera(cameraInfo.getPosition(), cameraInfo.getForwardVector());
-    passBuilder.geometry(scene.getRenderableData(), view.getVisibleRenderables());
+    passBuilder.geometry(view.getRenderableData(), view.getVisibleRenderables());
 
     // --------------------------------------------------------------------------------------------
     // structure pass -- automatically culled if not used
@@ -1176,7 +1233,7 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
                 // FIXME: use a dummy resource instead
                 builder.sideEffect();
             },
-            [=, &js, &view, &ppm](auto&, auto&, DriverApi& driver) {
+            [=, &arena, &js, &view, &ppm](auto&, auto&, DriverApi& driver) {
                 // prepare color grading as subpass material
                 if (colorGradingConfig.asSubpass) {
                     ppm.colorGradingPrepareSubpass(driver,
@@ -1196,7 +1253,7 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
                 // in parallel with .compile()
                 if (auto sync = view.getFroxelizerSync()) {
                     js.waitAndRelease(sync);
-                    view.commitFroxels(driver);
+                    view.commitFroxels(driver, arena);
                 }
             });
 
@@ -1582,8 +1639,12 @@ void FRenderer::renderJob(DriverApi& driver, RootArenaScope& rootArenaScope, FVi
 
     // save the current history entry and destroy the oldest entry
     view.commitFrameHistory(engine);
+    view.finish(arena);
 
     recordHighWatermark(commandArena.getListener().getHighWatermark());
+
+    // return the memory used for commandArena to the main arena
+    arena.free(arenaBegin, perFrameCommandsSize);
 }
 
 } // namespace filament

@@ -53,11 +53,6 @@ void Texture::setImage(Engine& engine, size_t const level,
             level, xoffset, yoffset, zoffset, width, height, depth, std::move(buffer));
 }
 
-void Texture::setImage(Engine& engine, size_t const level,
-        PixelBufferDescriptor&& buffer, const FaceOffsets& faceOffsets) const {
-    downcast(this)->setImage(downcast(engine), level, std::move(buffer), faceOffsets);
-}
-
 backend::AsyncCallId Texture::setImageAsync(Engine& engine, size_t const level,
         uint32_t const xoffset, uint32_t const yoffset, uint32_t const zoffset,
         uint32_t const width, uint32_t const height, uint32_t const depth,
@@ -89,7 +84,10 @@ void Texture::generateMipmaps(Engine& engine) const {
 }
 
 bool Texture::isCreationComplete() const noexcept {
-    return downcast(this)->isCreationComplete();
+    // Deliberately not FTexture::isCreationSettled(), which is the internal lifetime
+    // gate and is true even for a canceled creation. Callers of this public method are
+    // asking whether the resource is usable.
+    return downcast(this)->isCreationSuccessful();
 }
 
 bool Texture::isTextureFormatSupported(Engine& engine, InternalFormat const format) noexcept {

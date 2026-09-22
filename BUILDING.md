@@ -13,10 +13,10 @@ section below.
 
 To build Filament for Android you must also install the following:
 
-- Android Studio Flamingo or more recent
+- Android Studio Quail or more recent
 - Android SDK
-- Android NDK 25.1 or higher
-- Java 17
+- Android NDK 29 or higher
+- Java 21
 
 ## Environment variables
 
@@ -83,6 +83,8 @@ The following CMake options are boolean options specific to Filament:
 - `FILAMENT_ENABLE_RTTI`:          Enable C++ RTTI (default: OFF).
 
 Note: If you intend to use the JNI library (Android/Java build), you need to have `FILAMENT_ENABLE_EXCEPTIONS` enabled. If you are using Filament on Android as a pure native library and want to save space, you can disable it (e.g., using `./build.sh -E`).
+
+`build.sh -E` will disable exceptions when building the target libraries, but host tools will still be built with exceptions unless `-y none` is also specified. This is because tools such as `cmgen` and their `imageio` dependency still require exceptions. If both `-E` and `-y none` are specified, builds that include `cmgen`, `imageio`, or other exception-dependent tools will fail to compile.
 
 To turn an option on or off:
 
@@ -187,6 +189,8 @@ See [ios/samples/README.md](./ios/samples/README.md) for more information.
 ## Windows
 
 ### Building on Windows with Visual Studio 2019 or later
+
+> ⚠️**NOTE:** Filament doesn't support MSYS2-based environment.
 
 Install the following components:
 

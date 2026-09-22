@@ -103,19 +103,34 @@ public:
     explicit FView(FEngine& engine);
     ~FView() noexcept;
 
+    FScene::RenderableSoa& getRenderableData() const noexcept {
+        assert_invariant(mSceneCache);
+        return mSceneCache->renderableData;
+    }
+    FScene::LightSoa& getLightData() const noexcept {
+        assert_invariant(mSceneCache);
+        return mSceneCache->lightData;
+    }
+
     void terminate(FEngine& engine);
 
     CameraInfo computeCameraInfo(FEngine const& engine) const noexcept;
 
     // note: viewport/cameraInfo are passed by value to make it clear that prepare cannot
     // keep references on them that would outlive the scope of prepare() (e.g. with JobSystem).
-    void prepare(FEngine& engine, backend::DriverApi& driver, RootArenaScope& rootArenaScope,
+    void prepare(FEngine& engine, backend::DriverApi& driver, LinearAllocatorArena& arena,
             Viewport viewport, CameraInfo cameraInfo,
             math::float4 const& userTime, bool needsAlphaChannel) noexcept;
 
-    void setScene(FScene* scene) { mScene = scene; }
+    // call at the end of frame rendering to free per-frame data
+    void finish(LinearAllocatorArena& arena);
+
+    void setScene(FScene* scene);
     FScene const* getScene() const noexcept { return mScene; }
     FScene* getScene() noexcept { return mScene; }
+
+    bool hasContactShadows() const noexcept;
+    void detachScene(FScene const* scene) noexcept;
 
     void setCullingCamera(FCamera* camera) noexcept { mCullingCamera = camera; }
     void setViewingCamera(FCamera* camera) noexcept { mViewingCamera = camera; }
@@ -182,18 +197,19 @@ public:
     void prepareShadowMapping(FEngine const& engine, backend::Handle<backend::HwTexture> structure) const noexcept;
     void prepareShadowMapping() const noexcept;
 
-    void commitFroxels(backend::DriverApi& driverApi) const noexcept;
+    void commitFroxels(backend::DriverApi& driverApi, LinearAllocatorArena& arena) const noexcept;
     void commitUniforms(backend::DriverApi& driver) const noexcept;
     void commitDescriptorSet(backend::DriverApi& driver) const noexcept;
 
     utils::JobSystem::Job* getFroxelizerSync() const noexcept { return mFroxelizerSync; }
     void setFroxelizerSync(utils::JobSystem::Job* sync) noexcept { mFroxelizerSync = sync; }
 
-    // ultimately decides to use the DIR variant
+    // ultimately decides the directional-lighting specialization constant
     bool hasDirectionalLighting() const noexcept { return mHasDirectionalLighting; }
 
-    // ultimately decides to use the DYN variant
+    // ultimately decides the dynamic-lighting specialization constant
     bool hasDynamicLighting() const noexcept { return mHasDynamicLighting; }
+    bool hasExtraDirectionalLights() const noexcept { return mHasExtraDirectionalLights; }
 
     // ultimately decides to use the SRE variant
     bool hasShadowing() const noexcept { return mHasShadowing; }
@@ -203,8 +219,7 @@ public:
     bool needsShadowMap() const noexcept { return mNeedsShadowMap; }
     bool hasFog() const noexcept { return mFogOptions.enabled && mFogOptions.density > 0.0f; }
     bool hasVSM() const noexcept { return mShadowType == ShadowType::VSM; }
-    bool hasDPCF() const noexcept { return mShadowType == ShadowType::DPCF; }
-    bool hasPCSS() const noexcept { return mShadowType == ShadowType::PCSS; }
+    bool hasPCSS() const noexcept { return mShadowType == ShadowType::PCSS || mShadowType == ShadowType::DPCF; }
     bool hasPicking() const noexcept { return mActivePickingQueriesList != nullptr; }
     bool hasStereo() const noexcept {
         return mIsStereoSupported && mStereoscopicOptions.enabled;
@@ -433,6 +448,10 @@ public:
         return mVisibleRenderables;
     }
 
+    int32_t getVisibleRenderableCount() const noexcept {
+        return mVisibleRenderableCount;
+    }
+
     Range const& getVisibleDirectionalShadowCasters() const noexcept {
         return mVisibleDirectionalShadowCasters;
     }
@@ -542,6 +561,8 @@ private:
         PickingQueryResult result{};
     };
 
+    void invalidateSceneCache() noexcept;
+
     void prepareVisibleRenderables(utils::JobSystem& js,
             Frustum const& frustum, FScene::RenderableSoa& renderableData) const noexcept;
 
@@ -579,6 +600,7 @@ private:
     DescriptorSet mCommonRenderableDescriptorSet;
 
     FScene* mScene = nullptr;
+    std::unique_ptr<FScene::SceneCacheData> mSceneCache;
     // The camera set by the user, used for culling and viewing
     FCamera* mCullingCamera = nullptr;
     // The optional (debug) camera, used only for viewing
@@ -649,9 +671,12 @@ private:
     Range mVisibleRenderables;
     Range mVisibleDirectionalShadowCasters;
     Range mSpotLightShadowCasters;
+    int32_t mVisibleRenderableCount = -1;
     uint32_t mRenderableUBOElementCount = 0;
+    utils::Slice<float> mDistancesBuffer{};
     mutable bool mHasDirectionalLighting = false;
     mutable bool mHasDynamicLighting = false;
+    mutable bool mHasExtraDirectionalLights = false;
     mutable bool mHasShadowing = false;
     mutable bool mNeedsShadowMap = false;
 

@@ -17,9 +17,9 @@
 #ifndef TNT_MATH_BENCHMARK_PEROFRMANCECOUNTERS_H
 #define TNT_MATH_BENCHMARK_PEROFRMANCECOUNTERS_H
 
-#include <benchmark/benchmark.h>
-
 #include <utils/Profiler.h>
+
+#include <benchmark/benchmark.h>
 
 #include <cmath>
 
@@ -44,12 +44,18 @@ public:
         counters = profiler.readCounters();
         if (profiler.isValid()) {
             auto avgItem = double(state.iterations()) / state.items_processed();
-            state.counters.insert({
-                    { "C",   { avgItem * (double)counters.getCpuCycles(),    benchmark::Counter::kAvgIterations }},
-                    { "I",   { avgItem * (double)counters.getInstructions(), benchmark::Counter::kAvgIterations }},
-                    { "BPU", { std::floor(0.5 + avgItem * (double)counters.getBranchMisses() / state.iterations()), benchmark::Counter::kDefaults }},
-                    { "CPI", {           (double)counters.getCPI(),          benchmark::Counter::kAvgThreads }},
-            });
+            if (counters.getInstructions() > 0) {
+                state.counters.insert({
+                        { "C",   { avgItem * (double)counters.getCpuCycles(),    benchmark::Counter::kAvgIterations }},
+                        { "I",   { avgItem * (double)counters.getInstructions(), benchmark::Counter::kAvgIterations }},
+                        { "BPU", { avgItem * (double)counters.getBranchMisses(), benchmark::Counter::kAvgIterations }},
+                        { "CPI", {           (double)counters.getCPI(),          benchmark::Counter::kAvgThreads }},
+                });
+            } else if (counters.getCpuCycles() > 0) {
+                state.counters.insert({
+                        { "C",   { avgItem * (double)counters.getCpuCycles(),    benchmark::Counter::kAvgIterations }},
+                });
+            }
         }
     }
 };

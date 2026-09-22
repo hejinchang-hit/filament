@@ -24,6 +24,7 @@
 #include "HwDescriptorSetLayoutFactory.h"
 #include "HwVertexBufferInfoFactory.h"
 #include "MaterialCache.h"
+#include "MaterialDefinition.h"
 #include "PostProcessManager.h"
 #include "ResourceList.h"
 #include "UboManager.h"
@@ -36,10 +37,10 @@
 #include "ds/DescriptorSetLayout.h"
 
 #include "details/BufferObject.h"
-#include "details/Camera.h"
 #include "details/ColorGrading.h"
 #include "details/DebugRegistry.h"
 #include "details/Fence.h"
+#include "details/FramePacer.h"
 #include "details/InstanceBuffer.h"
 #include "details/MorphTargetBuffer.h"
 #include "details/RenderTarget.h"
@@ -48,15 +49,17 @@
 #include "details/Sync.h"
 
 #include <private/filament/EngineEnums.h>
+#include <private/filament/Variant.h>
 
 #include <private/backend/CommandBufferQueue.h>
 #include <private/backend/CommandStream.h>
-#include <private/backend/DriverApi.h>
 
 #include <private/utils/FeatureFlagManager.h>
 
+
 #include <filament/ColorGrading.h>
 #include <filament/Engine.h>
+#include <filament/FramePacer.h>
 #include <filament/IndirectLight.h>
 #include <filament/Material.h>
 #include <filament/Skybox.h>
@@ -65,27 +68,35 @@
 #include <filament/VertexBuffer.h>
 #include <filament/IndexBuffer.h>
 
+#include <backend/CallbackHandler.h>
 #include <backend/DriverEnums.h>
 
 #include <utils/Allocator.h>
 #include <utils/compiler.h>
+#include <utils/Condition.h>
 #include <utils/CountDownLatch.h>
+#include <utils/debug.h>
 #include <utils/FixedCapacityVector.h>
 #include <utils/Invocable.h>
 #include <utils/JobSystem.h>
+#include <utils/memalign.h>
+#include <utils/Mutex.h>
 #include <utils/Slice.h>
+#include <utils/PagedArenaBitsetPool.h>
 #include <utils/tribool.h>
 
+#include <cstddef>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <new>
 #include <optional>
 #include <string_view>
 #include <random>
 #include <thread>
-#include <mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -178,7 +189,7 @@ public:
     // the per-frame Area is used by all Renderer, so they must run in sequence and
     // have freed all allocated memory when done. If this needs to change in the future,
     // we'll simply have to use separate Areas (for instance).
-    LinearAllocatorArena& getPerRenderPassArena() noexcept { return mPerRenderPassArena; }
+    auto& getPerRenderPassArena() noexcept { return mPerRenderPassArena; }
 
     // Material IDs...
     uint32_t getMaterialId() const noexcept { return mMaterialId++; }
@@ -221,7 +232,7 @@ public:
     void signalFence(FenceSignal& signal, FenceSignal::State s) noexcept;
 
     // Waits for a fence to be signaled or for a timeout.
-    Fence::FenceStatus waitFence(FenceSignal& signal, uint64_t timeout) noexcept;
+    Fence::FenceStatus waitFence(FenceSignal& signal, uint64_t timeout) noexcept UTILS_NO_THREAD_SAFETY_ANALYSIS;
 
     size_t getMaxAutomaticInstances() const noexcept {
         return CONFIG_MAX_INSTANCES;
@@ -297,7 +308,7 @@ public:
 
     // Return a vector of shader languages, in order of preference.
     utils::FixedCapacityVector<backend::ShaderLanguage> getShaderLanguage() const noexcept {
-        backend::ShaderLanguage preferredLanguage;
+        backend::ShaderLanguage preferredLanguage{};
 
         switch (mConfig.preferredShaderLanguage) {
             case Config::ShaderLanguage::DEFAULT:
@@ -353,6 +364,7 @@ public:
             MaterialDefinition const& definition) noexcept;
     FTexture* createTexture(const Texture::Builder& builder) noexcept;
     FSkybox* createSkybox(const Skybox::Builder& builder) noexcept;
+    FFramePacer* createFramePacer(const FramePacer::Builder& builder) noexcept;
     FColorGrading* createColorGrading(const ColorGrading::Builder& builder) noexcept;
     FStream* createStream(const Stream::Builder& builder) noexcept;
     FRenderTarget* createRenderTarget(const RenderTarget::Builder& builder) noexcept;
@@ -390,6 +402,7 @@ public:
     bool destroy(const FMaterial* p);
     bool destroy(const FMaterialInstance* p);
     bool destroy(const FRenderer* p);
+    bool destroy(const FFramePacer* p);
     bool destroy(const FScene* p);
     bool destroy(const FSkybox* p);
     bool destroy(const FColorGrading* p);
@@ -456,7 +469,7 @@ public:
 
     // flush the current buffer based on some heuristics
     void flushIfNeeded() {
-        auto counter = mFlushCounter + 1;
+        auto const counter = mFlushCounter + 1;
         if (UTILS_LIKELY(counter < 128)) {
             mFlushCounter = counter;
         } else {
@@ -603,8 +616,12 @@ public:
 
     static utils::FixedCapacityVector<Variant> getMaterialCompileVariants(
         FView const* view,
+        FMaterial const* material,
         utils::tribool shadowReceiver,
         utils::tribool skinning) noexcept;
+
+    static utils::FixedCapacityVector<DynamicSpecConstKey> getMaterialCompileDynamicSpecConstKey(
+        FView const* view, FMaterial const* material) noexcept;
 
 private:
     explicit FEngine(Builder const& builder);
@@ -622,14 +639,8 @@ private:
     template<typename T>
     bool terminateAndDestroy(const T* ptr, ResourceList<T>& list);
 
-    template<typename T, typename Lock>
-    bool terminateAndDestroyLocked(Lock& lock, const T* p, ResourceList<T>& list);
-
     template<typename T>
     void cleanupResourceList(ResourceList<T>&& list);
-
-    template<typename T, typename Lock>
-    void cleanupResourceListLocked(Lock& lock, ResourceList<T>&& list);
 
     backend::Driver* mDriver = nullptr;
     backend::Handle<backend::HwRenderTarget> mDefaultRenderTarget;
@@ -662,6 +673,7 @@ private:
 
     ResourceList<FBufferObject> mBufferObjects{ "BufferObject" };
     ResourceList<FRenderer> mRenderers{ "Renderer" };
+    ResourceList<FFramePacer> mFramePacers{ "FramePacer" };
     ResourceList<FView> mViews{ "View" };
     ResourceList<FScene> mScenes{ "Scene" };
     ResourceList<FSwapChain> mSwapChains{ "SwapChain" };
@@ -679,8 +691,8 @@ private:
     ResourceList<FRenderTarget> mRenderTargets{ "RenderTarget" };
 
     // the fence list is accessed from multiple threads
-    utils::Mutex mFenceListLock;
-    ResourceList<FFence> mFences{"Fence"};
+    mutable utils::Mutex mFenceListLock;
+    ResourceList<FFence> mFences UTILS_GUARDED_BY(mFenceListLock){"Fence"};
 
     mutable utils::Mutex mFenceLock;
     mutable utils::Condition mFenceCondition;
@@ -688,8 +700,8 @@ private:
 
     // the sync list is accessed from multiple threads, because they are
     // synchronization objects.
-    utils::Mutex mSyncListLock;
-    ResourceList<FSync> mSyncs{ "Sync" };
+    mutable utils::Mutex mSyncListLock;
+    ResourceList<FSync> mSyncs UTILS_GUARDED_BY(mSyncListLock){ "Sync" };
 
     mutable uint32_t mMaterialId = 0;
 
@@ -700,13 +712,13 @@ private:
 
     std::thread mDriverThread;
     backend::CommandBufferQueue mCommandBufferQueue;
-    std::aligned_storage<sizeof(DriverApi), alignof(DriverApi)>::type mDriverApiStorage;
+    std::aligned_storage_t<sizeof(DriverApi), alignof(DriverApi)> mDriverApiStorage;
     static_assert( sizeof(mDriverApiStorage) >= sizeof(DriverApi) );
 
     uint32_t mFlushCounter = 0;
 
     UboManager* mUboManager = nullptr;
-    RootArenaScope::Arena mPerRenderPassArena;
+    LinearAllocatorArena mPerRenderPassArena;
     HeapAllocatorArena mHeapAllocator;
 
     utils::JobSystem mJobSystem;
@@ -745,6 +757,7 @@ private:
 
     // Creation parameters
     Config mConfig;
+    ColorGrading::Builder mColorGradingBuilder;
 
     std::vector<std::function<bool()>> mDeferredAsyncObjectDestruction;
 
@@ -791,6 +804,17 @@ public:
         struct {
             bool combine_multiview_images = false;
         } stereo;
+        struct {
+            // When enabled (d.vulkan.debug_utils_names), the Vulkan backend explicitly requests the
+            // VK_EXT_debug_utils extension at startup and tracks group markers in the command
+            // buffer. It will also name the render passes with the top group marker so they show up
+            // in RenderDoc and other GPU debugging tools.
+            std::atomic<bool> enable_debug_utils_names{ false };
+            // When enabled (d.vulkan.renderdoc_capture), the Vulkan backend enables the RenderDoc
+            // capture layer and disables features incompatible with RenderDoc (such as lazily
+            // allocated memory and non-replayable external memory types) to support frame captures.
+            std::atomic<bool> enable_renderdoc_capture{ false };
+        } vulkan;
         matdbg::DebugServer* server = nullptr;
         FgviewerManager* fgviewer = nullptr;
     } debug;

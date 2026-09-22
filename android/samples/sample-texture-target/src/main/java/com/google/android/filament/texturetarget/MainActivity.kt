@@ -21,7 +21,7 @@ import android.app.Activity
 import android.hardware.HardwareBuffer
 import android.opengl.Matrix
 import android.os.Bundle
-import android.view.Choreographer
+import com.google.android.filament.android.ChoreographerHelper
 import android.view.Surface
 import android.view.SurfaceView
 import android.view.animation.LinearInterpolator
@@ -31,6 +31,7 @@ import com.google.android.filament.VertexBuffer.AttributeType
 import com.google.android.filament.VertexBuffer.VertexAttribute
 import com.google.android.filament.android.DisplayHelper
 import com.google.android.filament.android.FilamentHelper
+import com.google.android.filament.android.TextureHelper
 import com.google.android.filament.android.UiHelper
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -49,7 +50,6 @@ class MainActivity : Activity() {
     private lateinit var surfaceView: SurfaceView
     private lateinit var uiHelper: UiHelper
     private lateinit var displayHelper: DisplayHelper
-    private lateinit var choreographer: Choreographer
 
     private lateinit var engine: Engine
     private lateinit var renderer: Renderer
@@ -88,7 +88,6 @@ class MainActivity : Activity() {
         useExternalTexture = intent.getBooleanExtra("useExternalTexture", true)
         surfaceView = SurfaceView(this)
         setContentView(surfaceView)
-        choreographer = Choreographer.getInstance()
         displayHelper = DisplayHelper(this)
         setupSurfaceView()
         setupFilament()
@@ -105,6 +104,7 @@ class MainActivity : Activity() {
     private fun setupFilament() {
         engine = Engine.create()
         renderer = engine.createRenderer()
+        frameScheduler.setRenderer(renderer)
         scene = engine.createScene()
         view = engine.createView()
         camera = engine.createCamera(engine.entityManager.create())
@@ -299,19 +299,19 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        choreographer.postFrameCallback(frameScheduler)
+        frameScheduler.post()
         animator.start()
     }
 
     override fun onPause() {
         super.onPause()
-        choreographer.removeFrameCallback(frameScheduler)
+        frameScheduler.remove()
         animator.cancel()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        choreographer.removeFrameCallback(frameScheduler)
+        frameScheduler.remove()
         animator.cancel()
         uiHelper.detach()
 
@@ -347,9 +347,8 @@ class MainActivity : Activity() {
         engine.destroy()
     }
 
-    inner class FrameCallback : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
-            choreographer.postFrameCallback(this)
+    inner class FrameCallback : ChoreographerHelper() {
+        override fun onFrame(frameTimeNanos: Long) {
             if (uiHelper.isReadyToRender) {
                 if (renderer.beginFrame(swapChain!!, frameTimeNanos)) {
                     // Render the triangle to the texture.
@@ -412,7 +411,7 @@ class MainActivity : Activity() {
                     .external()
                     .build(engine)
 
-                texture!!.setExternalImage(engine, hardwareBuffer!!)
+                TextureHelper.setExternalImage(engine, texture!!, hardwareBuffer!!)
             } else {
                 texture = Texture.Builder()
                     .width(width)

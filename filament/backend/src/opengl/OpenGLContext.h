@@ -17,15 +17,14 @@
 #ifndef TNT_FILAMENT_BACKEND_OPENGLCONTEXT_H
 #define TNT_FILAMENT_BACKEND_OPENGLCONTEXT_H
 
-#include <backend/platforms/OpenGLPlatform.h>
+#include "gl_headers.h"
 
 #include <backend/DriverEnums.h>
 #include <backend/Handle.h>
+#include <backend/platforms/OpenGLPlatform.h>
 
-#include "gl_headers.h"
-
-#include <utils/compiler.h>
 #include <utils/bitset.h>
+#include <utils/compiler.h>
 #include <utils/debug.h>
 
 #include <math/vec2.h>
@@ -297,23 +296,32 @@ public:
         // Some Mali drivers also have problems with this (b/445721121)
         bool disable_framebuffer_fetch_extension;
 
+        // Some drivers have issues with GL_EXT_sRGB on ES2.0
+        bool disable_es2_srgb_ext;
+
+        // WebGL with ANGLE's Metal backend can incur significant overhead when binding many ranges
+        // from a large UBO, especially when uniform layout conversion is required. In practice,
+        // batching is slower than using individual UBOs on this path.
+        bool disable_material_instance_uniform_batching;
+
     } bugs = {};
 
     struct Procs {
-        void (* bindVertexArray)(GLuint array);
-        void (* deleteVertexArrays)(GLsizei n, const GLuint* arrays);
-        void (* genVertexArrays)(GLsizei n, GLuint* arrays);
+        void (FILAMENT_GL_APIENTRYP bindVertexArray)(GLuint array);
+        void (FILAMENT_GL_APIENTRYP deleteVertexArrays)(GLsizei n, const GLuint* arrays);
+        void (FILAMENT_GL_APIENTRYP genVertexArrays)(GLsizei n, GLuint* arrays);
 
-        void (* genQueries)(GLsizei n, GLuint* ids);
-        void (* deleteQueries)(GLsizei n, const GLuint* ids);
-        void (* beginQuery)(GLenum target, GLuint id);
-        void (* endQuery)(GLenum target);
-        void (* getQueryObjectuiv)(GLuint id, GLenum pname, GLuint* params);
-        void (* getQueryObjectui64v)(GLuint id, GLenum pname, GLuint64* params);
+        void (FILAMENT_GL_APIENTRYP genQueries)(GLsizei n, GLuint* ids);
+        void (FILAMENT_GL_APIENTRYP deleteQueries)(GLsizei n, const GLuint* ids);
+        void (FILAMENT_GL_APIENTRYP beginQuery)(GLenum target, GLuint id);
+        void (FILAMENT_GL_APIENTRYP endQuery)(GLenum target);
+        void (FILAMENT_GL_APIENTRYP getQueryObjectuiv)(GLuint id, GLenum pname, GLuint* params);
+        void (FILAMENT_GL_APIENTRYP getQueryObjectui64v)(GLuint id, GLenum pname, GLuint64* params);
 
-        void (* invalidateFramebuffer)(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+        void (FILAMENT_GL_APIENTRYP invalidateFramebuffer)(GLenum target, GLsizei numAttachments,
+                const GLenum *attachments);
 
-        void (* maxShaderCompilerThreadsKHR)(GLuint count);
+        void (FILAMENT_GL_APIENTRYP maxShaderCompilerThreadsKHR)(GLuint count);
     } procs{};
 
     // GL version info — immutable after construction
@@ -390,6 +398,12 @@ private:
             {   bugs.disable_framebuffer_fetch_extension,
                     "disable_framebuffer_fetch_extension",
                     ""},
+            {   bugs.disable_es2_srgb_ext,
+                    "disable_es2_srgb_ext",
+                    ""},
+            {   bugs.disable_material_instance_uniform_batching,
+                    "disable_material_instance_uniform_batching",
+                    "" }
     }};
 
     // this is chosen to minimize code size
@@ -420,7 +434,7 @@ private:
     static void initProcs(Procs* procs,
             Extensions const& exts, GLint major, GLint minor) noexcept;
 
-    static void initWorkarounds(Bugs const& bugs, Extensions* ext);
+    static void initWorkarounds(Bugs const& bugs, Extensions* ext, FeatureLevel const featureLevel);
 
     static FeatureLevel resolveFeatureLevel(GLint major, GLint minor,
             Extensions const& exts,

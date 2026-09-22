@@ -16,8 +16,8 @@
 
 #include "DriverBase.h"
 
-#include "private/backend/Driver.h"
-#include "private/backend/CommandStream.h"
+#include <private/backend/CommandStream.h>
+#include <private/backend/Driver.h>
 
 #include <backend/AcquiredImage.h>
 #include <backend/BufferDescriptor.h>
@@ -25,10 +25,11 @@
 
 #include <private/utils/Tracing.h>
 
-#include <utils/Logger.h>
 #include <utils/compiler.h>
 #include <utils/debug.h>
 #include <utils/JobSystem.h>
+#include <utils/Logger.h>
+#include <utils/Mutex.h>
 #include <utils/ostream.h>
 #include <utils/Panic.h>
 
@@ -49,18 +50,28 @@ using namespace filament::math;
 
 namespace filament::backend {
 
+namespace {
+
+// Debug-only ceiling on purgeAll()'s drain rounds. Legitimate chains are a couple of hops deep
+// (e.g., countdownCallback -> user callback), so anything close to this is a callback rescheduling
+// itself.
+UTILS_UNUSED_IN_RELEASE constexpr size_t MAX_PURGE_ROUNDS = 256;
+
+} // anonymous namespace
+
 DriverBase::DriverBase(const Platform::DriverConfig& driverConfig) noexcept
     : mDriverConfig(driverConfig) {
     if constexpr (UTILS_HAS_THREADING) {
         // This thread services user callbacks
         mServiceThread = std::thread([this]() {
             JobSystem::setThreadName("ServiceThread");
+            decltype(mServiceThreadCallbackQueue) callbacks;
             do {
                 auto& serviceThreadCondition = mServiceThreadCondition;
                 auto& serviceThreadCallbackQueue = mServiceThreadCallbackQueue;
 
                 // wait for some callbacks to dispatch
-                std::unique_lock<std::mutex> lock(mServiceThreadLock);
+                UniqueLock lock(mServiceThreadLock);
                 while (serviceThreadCallbackQueue.empty() && !mExitRequested) {
                     serviceThreadCondition.wait(lock);
                 }
@@ -68,12 +79,13 @@ DriverBase::DriverBase(const Platform::DriverConfig& driverConfig) noexcept
                     break;
                 }
                 // move the callbacks to a temporary vector
-                auto callbacks(std::move(serviceThreadCallbackQueue));
+                callbacks.swap(serviceThreadCallbackQueue);
                 lock.unlock();
                 // and make sure to call them without our lock held
                 for (auto[handler, callback, user]: callbacks) {
                     handler->post(user, callback);
                 }
+                callbacks.clear();
             } while (true);
         });
     }
@@ -108,22 +120,44 @@ void DriverBase::CallbackData::release(CallbackData* data) {
 
 void DriverBase::scheduleCallback(CallbackHandler* handler, void* user, CallbackHandler::Callback callback) {
     if (handler && UTILS_HAS_THREADING) {
-        std::lock_guard<std::mutex> const lock(mServiceThreadLock);
+        LockGuard const lock(mServiceThreadLock);
         mServiceThreadCallbackQueue.emplace_back(handler, callback, user);
         mServiceThreadCondition.notify_one();
     } else {
-        std::lock_guard<std::mutex> const lock(mPurgeLock);
+        LockGuard const lock(mPurgeLock);
         mCallbacks.emplace_back(user, callback);
     }
 }
 
-void DriverBase::purge() noexcept {
+bool DriverBase::dispatchQueuedCallbacks() noexcept {
     decltype(mCallbacks) callbacks;
-    std::unique_lock<std::mutex> lock(mPurgeLock);
-    std::swap(callbacks, mCallbacks);
-    lock.unlock(); // don't remove this, it ensures callbacks are called without lock held
+    {
+        LockGuard const lock(mPurgeLock);
+        if (mCallbacks.empty()) {
+            return false;
+        }
+        std::swap(callbacks, mCallbacks);
+    }
+    // the scope above matters: it ensures callbacks are called without the lock held
     for (auto& item : callbacks) {
         item.second(item.first);
+    }
+    return true;
+}
+
+void DriverBase::purge() noexcept {
+    dispatchQueuedCallbacks();
+}
+
+void DriverBase::purgeAll() noexcept {
+    // Unlike purge(), this keeps going until the queue stays empty, because a callback is allowed
+    // to schedule another one: with no ServiceThread, CountdownCallbackHandler::countdownCallback
+    // lands here and schedules the user callback from inside this loop.
+    UTILS_UNUSED_IN_RELEASE size_t rounds = 0;
+    while (dispatchQueuedCallbacks()) {
+        // A callback that reschedules itself unconditionally would spin here forever.
+        // Assert failure here indicates a bug.
+        assert_invariant(++rounds < MAX_PURGE_ROUNDS);
     }
 }
 
@@ -186,12 +220,18 @@ void DriverBase::stopServiceThread() noexcept {
     }
 
     {
-        std::lock_guard<std::mutex> lock(mServiceThreadLock);
+        LockGuard const lock(mServiceThreadLock);
         mExitRequested = true;
     }
     mServiceThreadCondition.notify_one();
     mServiceThread.join();
-    assert_invariant(mServiceThreadCallbackQueue.empty());
+
+#ifndef NDEBUG
+    {
+        LockGuard const lock(mServiceThreadLock);
+        assert_invariant(mServiceThreadCallbackQueue.empty());
+    }
+#endif
 }
 #endif
 
@@ -224,6 +264,7 @@ size_t Driver::getElementTypeSize(ElementType type) noexcept {
         case ElementType::HALF3:    return sizeof(half3);
         case ElementType::HALF4:    return sizeof(half4);
     }
+    return 0;
 }
 
 // ------------------------------------------------------------------------------------------------

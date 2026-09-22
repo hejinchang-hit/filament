@@ -17,24 +17,23 @@
 #ifndef TNT_FILAMENT_PERVIEWUNIFORMS_H
 #define TNT_FILAMENT_PERVIEWUNIFORMS_H
 
-#include <filament/Viewport.h>
-
 #include "DescriptorSet.h"
-
 #include "TypedUniformBuffer.h"
 
 #include <private/filament/EngineEnums.h>
 #include <private/filament/UibStructs.h>
+
+#include <filament/Viewport.h>
 
 #include <backend/DriverEnums.h>
 #include <backend/Handle.h>
 
 #include <utils/EntityInstance.h>
 
+#include <math/mat4.h>
 #include <math/vec2.h>
 #include <math/vec3.h>
 #include <math/vec4.h>
-#include <math/mat4.h>
 
 #include <array>
 
@@ -115,6 +114,13 @@ public:
     void prepareDirectionalLight(FEngine& engine, float exposure,
             math::float3 const& sceneSpaceDirection, LightManagerInstance instance) noexcept;
 
+    // Directional lights in addition to the dominant one, evaluated without shadows.
+    // `sceneSpaceDirections` and `instances` are parallel arrays of `count` elements,
+    // with count <= CONFIG_MAX_EXTRA_DIRECTIONAL_LIGHTS.
+    void prepareExtraDirectionalLights(FEngine& engine, float exposure, size_t count,
+            math::float3 const* sceneSpaceDirections,
+            LightManagerInstance const* instances) noexcept;
+
     void prepareAmbientLight(FEngine const& engine,
             FIndirectLight const& ibl, float intensity, float exposure) noexcept;
 
@@ -124,8 +130,6 @@ public:
             VsmShadowOptions const& options) noexcept;
 
     void prepareShadowPCF(TextureHandle texture) noexcept;
-
-    void prepareShadowDPCF(TextureHandle texture) noexcept;
 
     void prepareShadowPCSS(TextureHandle texture) noexcept;
 

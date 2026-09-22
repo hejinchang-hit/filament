@@ -15,12 +15,13 @@
  */
 
 #include "MaterialCache.h"
+
 #include "MaterialParser.h"
 
-#include <backend/DriverEnums.h>
+#include "details/Engine.h"
+#include "details/Material.h"
 
-#include <details/Engine.h>
-#include <details/Material.h>
+#include <backend/DriverEnums.h>
 
 #include <utils/Logger.h>
 
@@ -50,8 +51,8 @@ MaterialCache::~MaterialCache() {
 }
 
 void MaterialCache::terminate(FEngine& engine) {
-    mPrograms.clearLruCache([&engine](backend::Handle<backend::HwProgram>& program) {
-        engine.getDriverApi().destroyProgram(program);
+    mPrograms.clearLruCache([&engine](ProgramCacheEntry& entry) {
+        engine.getDriverApi().destroyProgram(entry.program);
     });
     mDefinitions.clearLruCache([&engine](MaterialDefinition& definition) {
         definition.terminate(engine);

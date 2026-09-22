@@ -42,6 +42,10 @@ Entity const* LightManager::getEntities() const noexcept {
     return downcast(this)->getEntities();
 }
 
+Slice<Entity const> LightManager::getAllEntities() const noexcept {
+    return downcast(this)->getAllEntities();
+}
+
 LightManager::Instance LightManager::getInstance(Entity const e) const noexcept {
     return downcast(this)->getInstance(e);
 }
@@ -115,12 +119,12 @@ float LightManager::getSpotLightInnerCone(Instance const i) const noexcept {
 }
 
 void LightManager::setSunAngularRadius(Instance const i, float const angularRadius) noexcept {
-    downcast(this)->setSunAngularRadius(i, angularRadius);
+    downcast(this)->setSunAngularRadiusRad(i, angularRadius * f::DEG_TO_RAD);
 }
 
 float LightManager::getSunAngularRadius(Instance const i) const noexcept {
-    float radius = downcast(this)->getSunAngularRadius(i);
-    return radius * f::RAD_TO_DEG;
+    float const angularRadiusRad = downcast(this)->getSunAngularRadiusRad(i);
+    return angularRadiusRad * f::RAD_TO_DEG;
 }
 
 void LightManager::setSunHaloSize(Instance const i, float const haloSize) noexcept {

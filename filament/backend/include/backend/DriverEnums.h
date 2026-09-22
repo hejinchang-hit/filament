@@ -26,17 +26,17 @@
 
 #include <utils/BitmaskEnum.h>
 #include <utils/CString.h>
+#include <utils/debug.h>
 #include <utils/FixedCapacityVector.h>
 #include <utils/Invocable.h>
 #include <utils/StaticString.h>
-#include <utils/debug.h>
 
 #include <math/vec4.h>
 
 #include <array>
+#include <string_view>
 #include <type_traits>
 #include <variant>
-#include <string_view>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -155,6 +155,20 @@ enum class FeatureLevel : uint8_t {
     FEATURE_LEVEL_3       //!< OpenGL ES 3.1 features + 31 textures units + cubemap arrays
 };
 
+constexpr std::string_view to_string(FeatureLevel level) noexcept {
+    switch (level) {
+        case FeatureLevel::FEATURE_LEVEL_0:
+            return "FEATURE_LEVEL_0";
+        case FeatureLevel::FEATURE_LEVEL_1:
+            return "FEATURE_LEVEL_1";
+        case FeatureLevel::FEATURE_LEVEL_2:
+            return "FEATURE_LEVEL_2";
+        case FeatureLevel::FEATURE_LEVEL_3:
+            return "FEATURE_LEVEL_3";
+    }
+    return "UNKNOWN";
+}
+
 /**
  * Selects which driver a particular Engine should use.
  */
@@ -206,7 +220,7 @@ enum class ShaderLanguage {
     WGSL = 5,
 };
 
-constexpr const char* shaderLanguageToString(ShaderLanguage shaderLanguage) noexcept {
+constexpr std::string_view to_string(ShaderLanguage shaderLanguage) noexcept {
     switch (shaderLanguage) {
         case ShaderLanguage::ESSL1:
             return "ESSL 1.0";
@@ -224,6 +238,11 @@ constexpr const char* shaderLanguageToString(ShaderLanguage shaderLanguage) noex
             return "Unspecified";
     }
     return "UNKNOWN";
+}
+
+// DEPRECATED: use to_string(ShaderLanguage)
+constexpr const char* shaderLanguageToString(ShaderLanguage shaderLanguage) noexcept {
+    return to_string(shaderLanguage).data();
 }
 
 enum class ShaderStage : uint8_t {
@@ -826,6 +845,38 @@ enum class ElementType : uint8_t {
     HALF4,
 };
 
+constexpr std::string_view to_string(ElementType type) noexcept {
+    switch (type) {
+        case ElementType::BYTE:    return "BYTE";
+        case ElementType::BYTE2:   return "BYTE2";
+        case ElementType::BYTE3:   return "BYTE3";
+        case ElementType::BYTE4:   return "BYTE4";
+        case ElementType::UBYTE:   return "UBYTE";
+        case ElementType::UBYTE2:  return "UBYTE2";
+        case ElementType::UBYTE3:  return "UBYTE3";
+        case ElementType::UBYTE4:  return "UBYTE4";
+        case ElementType::SHORT:   return "SHORT";
+        case ElementType::SHORT2:  return "SHORT2";
+        case ElementType::SHORT3:  return "SHORT3";
+        case ElementType::SHORT4:  return "SHORT4";
+        case ElementType::USHORT:  return "USHORT";
+        case ElementType::USHORT2: return "USHORT2";
+        case ElementType::USHORT3: return "USHORT3";
+        case ElementType::USHORT4: return "USHORT4";
+        case ElementType::INT:     return "INT";
+        case ElementType::UINT:    return "UINT";
+        case ElementType::FLOAT:   return "FLOAT";
+        case ElementType::FLOAT2:  return "FLOAT2";
+        case ElementType::FLOAT3:  return "FLOAT3";
+        case ElementType::FLOAT4:  return "FLOAT4";
+        case ElementType::HALF:    return "HALF";
+        case ElementType::HALF2:   return "HALF2";
+        case ElementType::HALF3:   return "HALF3";
+        case ElementType::HALF4:   return "HALF4";
+    }
+    return "UNKNOWN";
+}
+
 //! Buffer object binding type
 enum class BufferObjectBinding : uint8_t {
     VERTEX,
@@ -1107,7 +1158,7 @@ enum class TextureFormat : uint16_t {
 TextureType getTextureType(TextureFormat format) noexcept;
 
 //! Bitmask describing the intended Texture Usage
-enum class TextureUsage : uint16_t {
+enum class UTILS_APIGEN_FLAGS TextureUsage : uint16_t {
     NONE                = 0x0000,
     COLOR_ATTACHMENT    = 0x0001,            //!< Texture can be used as a color attachment
     DEPTH_ATTACHMENT    = 0x0002,            //!< Texture can be used as a depth attachment
@@ -1583,6 +1634,14 @@ struct RenderPassFlags {
     TargetBufferFlags discardEnd;
 };
 
+// A clear-color value for a color attachment, stored as four doubles. The actual type family
+// (float / signed-int / unsigned-int) is inferred from the attachment's TextureFormat at clear
+// time, and the doubles are converted as-is into the matching GL/Vulkan/Metal/WebGPU call.
+// The caller must put a value into this double4 that is meaningful for the attachment family --
+// e.g., for a UINT attachment, put a value in [0, UINT32_MAX]. int32/uint32 round-trip through a
+// double exactly because double has a 53-bit mantissa.
+using ClearColorValue = math::double4;
+
 /**
  * Parameters of a render pass.
  */
@@ -1592,8 +1651,11 @@ struct RenderPassParams {
     Viewport viewport{};        //!< viewport for this pass
     DepthRange depthRange{};    //!< depth range for this pass
 
-    //! Color to use to clear the COLOR buffer. RenderPassFlags::clear must be set.
-    math::float4 clearColor = {};
+    //! Value used to clear the COLOR attachments. RenderPassFlags::clear must be set.
+    //! For integer-format attachments, put a value in the matching range (e.g., values in
+    //! [0, UINT32_MAX] for a UINT attachment); the backend converts the doubles as-is into the
+    //! matching native clear entry-point based on the attachment's TextureFormat.
+    ClearColorValue clearColor{};
 
     //! Depth value to clear the depth buffer with
     double clearDepth = 0.0;
@@ -1719,6 +1781,9 @@ enum class Workaround : uint16_t {
     DISABLE_DEPTH_PRECACHE_FOR_DEFAULT_MATERIAL,
     // Emulate an sRGB swapchain in shader code.
     EMULATE_SRGB_SWAPCHAIN,
+    // WebGL with ANGLE's Metal backend can incur significant overhead when binding many ranges
+    // from a large UBO.
+    DISABLE_MATERIAL_INSTANCE_UNIFORM_BATCHING,
 };
 
 using StereoscopicType = Platform::StereoscopicType;
@@ -1732,6 +1797,33 @@ using AsynchronousMode = Platform::AsynchronousMode;
 using AsyncCallId = uint32_t;
 
 static constexpr AsyncCallId InvalidAsyncCallId = std::numeric_limits<AsyncCallId>::max();
+
+/**
+ * Outcome of an asynchronous operation, reported to its completion callback.
+ *
+ * A completion callback that cannot say why it fired is ambiguous: chaining another operation from
+ * a callback that fired because the operation was canceled would proceed on a resource that was
+ * never populated. The caller cannot reconstruct the answer out of band either, because an
+ * operation can be canceled without anyone asking for it (the driver dropping queued work while
+ * shutting down).
+ *
+ * @see AsyncCallback, cancelAsyncJob
+ */
+enum class AsyncCallStatus : uint8_t {
+    COMPLETED,  //!< The operation ran to completion.
+    CANCELED,   //!< The operation never ran: it was canceled, or dropped because the driver is
+                //!< shutting down.
+};
+
+/**
+ * Completion callback of an asynchronous operation.
+ *
+ * This is deliberately not a CallbackHandler::Callback: that one is shared with readPixels(),
+ * fences, buffer release and others, none of which has a cancellation concept.
+ *
+ * @see AsyncCallStatus
+ */
+using AsyncCallback = void(*)(void* user, AsyncCallStatus status);
 
 using AsynchronousMode = Platform::AsynchronousMode;
 

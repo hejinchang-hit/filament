@@ -19,29 +19,29 @@
 
 #include "Allocators.h"
 
-#include "details/Scene.h"
 #include "details/Engine.h"
+#include "details/Scene.h"
 
-#include "private/filament/EngineEnums.h"
-#include "private/filament/UibStructs.h"
+#include <private/filament/EngineEnums.h>
+#include <private/filament/UibStructs.h>
 
 #include <filament/View.h>
 #include <filament/Viewport.h>
 
 #include <backend/Handle.h>
 
+#include <utils/bitset.h>
+#include <utils/compiler.h>
+#include <utils/debug.h>
+#include <utils/Slice.h>
+
 #include <math/mat4.h>
 #include <math/vec2.h>
 #include <math/vec3.h>
 #include <math/vec4.h>
 
-#include <utils/compiler.h>
-#include <utils/debug.h>
-#include <utils/bitset.h>
-#include <utils/Slice.h>
-
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <utility>
 
@@ -114,7 +114,7 @@ public:
      *
      * return true if updateUniforms() needs to be called
      */
-    bool prepare(backend::DriverApi& driverApi, RootArenaScope& rootArenaScope,
+    bool prepare(backend::DriverApi& driverApi, LinearAllocatorArena& arena,
             Viewport const& viewport,
             const math::mat4f& projection, float projectionNear, float projectionFar,
             math::float4 const& clipTransform) noexcept;
@@ -142,7 +142,7 @@ public:
     static size_t getFroxelRecordBufferByteCount(FEngine::DriverApi& driverApi) noexcept;
 
     // send froxel data to GPU
-    void commit(backend::DriverApi& driverApi);
+    void commit(backend::DriverApi& driverApi, LinearAllocatorArena& arena);
 
 
     /*
@@ -214,6 +214,8 @@ private:
     inline void setViewport(Viewport const& viewport) noexcept;
     inline void setProjection(const math::mat4f& projection, float near, float far) noexcept;
     bool update() noexcept;
+
+    void resetLocalArena() noexcept;
 
     void froxelizeLoop(FEngine& engine,
             math::mat4f const& viewMatrix, const FScene::LightSoa& lightData) const noexcept;

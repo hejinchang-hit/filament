@@ -18,11 +18,11 @@
  #define TNT_FILAMENT_BACKEND_VULKANTEXTURE_H
 
 #include "DriverBase.h"
-
 #include "VulkanCommands.h"
 #include "VulkanConstants.h"
 #include "VulkanMemory.h"
 #include "VulkanStagePool.h"
+
 #include "vulkan/memory/Resource.h"
 #include "vulkan/memory/ResourcePointer.h"
 #include "vulkan/utils/Image.h"
@@ -36,7 +36,7 @@ namespace filament::backend {
 
 struct VulkanTexture;
 
-struct VulkanStream : public HwStream, fvkmemory::Resource {
+struct VulkanStream : public HwStream, fvkmemory::ThreadSafeResource {
 
     //-- These methods are only called from the frontend
     void acquire(const AcquiredImage& image) {
@@ -54,13 +54,11 @@ struct VulkanStream : public HwStream, fvkmemory::Resource {
     const AcquiredImage& getAcquired() const { return user_thread.mAcquired; }
 
     //-- These methods are only called from the backend thread
-    fvkmemory::resource_ptr<VulkanTexture> getTexture(void* ahb) {
-        if (auto itr = mTextures.find(ahb); itr != mTextures.end()) {
-            return itr->second;
-        }
-        return {};
-    }
-    void pushImage(void* ahb, fvkmemory::resource_ptr<VulkanTexture> tex) { mTextures[ahb] = tex; }
+    // destroyStream() is a deferred command, but updateStreams() records its work from the
+    // frontend. This means a command can be recorded for a stream that has already been destroyed
+    // by the time the command executes. This marker lets such commands detect that case.
+    void markDestroyed() { backend_thread.mDestroyed = true; }
+    bool isDestroyed() const { return backend_thread.mDestroyed; }
 
 private:
     // These are only called from the frontend
@@ -69,14 +67,17 @@ private:
         AcquiredImage mPrevious;
     } user_thread;
 
-    // #TODO b/442937292
-    std::unordered_map<void*, fvkmemory::resource_ptr<VulkanTexture>> mTextures;
+    // These are only touched from the backend thread
+    struct {
+        bool mDestroyed = false;
+    } backend_thread;
 };
 
 struct VulkanTextureState : public fvkmemory::Resource {
     VulkanTextureState(VulkanStagePool& stagePool, VulkanCommands* commands, VmaAllocator allocator,
-            VkDevice device, VkImage image, VkDeviceMemory deviceMemory, VkFormat format,
-            VkImageViewType viewType, uint8_t levels, uint8_t layerCount,
+            VkDevice device, VkImage image, VkDeviceMemory deviceMemory,
+            VkDeviceMemory stagingMemory, VkBuffer stagingBuffer, Platform::ExternalImageHandle ahBuffer,
+            VkFormat format, VkImageViewType viewType, uint8_t levels, uint8_t layerCount,
             VkSamplerYcbcrConversion ycbcrConversion, VkImageUsageFlags usage, bool isProtected);
 
     ~VulkanTextureState();
@@ -135,6 +136,17 @@ private:
 
     } mYcbcr;
 
+    // Note: In the case of a software decoded YUV frame we introduced a staging buffer
+    // we need to copy the data from this source every time the data changes
+    struct SoftwareYUVStaging{
+        VkDeviceMemory memory;
+        VkBuffer buffer;
+        // Note: this may or may not be acceptable on one hand this is a platform object
+        // by definition it is platform agnostic. On the other hand this would be the
+        // only place where a platform specific object is tied to the VulkanTexture.
+        Platform::ExternalImageHandle ahbuffer;
+    } mSoftwareYUVStaging;
+
     VulkanLayout const mDefaultLayout;
     VkImageUsageFlags const mUsage;
     bool const mIsProtected;
@@ -160,7 +172,8 @@ struct VulkanTexture : public HwTexture, fvkmemory::Resource {
     VulkanTexture(VulkanContext const& context, VkDevice device, VmaAllocator allocator,
             fvkmemory::ResourceManager* resourceManager, VulkanCommands* commands, VkImage image,
             VkDeviceMemory memory, VkFormat format, VkSamplerYcbcrConversion conversion,
-            uint8_t samples, uint32_t width, uint32_t height, uint32_t depth,
+            VkDeviceMemory stagingMemory, VkBuffer stagingBuffer, Platform::ExternalImageHandle ahBuffer,
+            uint8_t levels, uint8_t samples, uint32_t width, uint32_t height, uint32_t depth,
             TextureUsage tusage, VulkanStagePool& stagePool);
 
     // Constructor for creating a texture view for wrt specific mip range
@@ -242,6 +255,24 @@ struct VulkanTexture : public HwTexture, fvkmemory::Resource {
         return mState->mIsProtected;
     }
 
+    bool isYUVStaging() {
+        return (mState->mSoftwareYUVStaging.buffer != VK_NULL_HANDLE);
+    }
+
+    VkDeviceMemory getYUVStagingMemory() {
+        return mState->mSoftwareYUVStaging.memory;
+    }
+
+    VkBuffer getYUVStagingBuffer() {
+        return mState->mSoftwareYUVStaging.buffer;
+    }
+
+    Platform::ExternalImageHandle getYUVStagingHandle() {
+        return mState->mSoftwareYUVStaging.ahbuffer;
+    }
+
+    bool isExternallySampled() const { return mState->mYcbcr.conversion != VK_NULL_HANDLE; }
+
     bool transitionLayout(VulkanCommandBuffer* commands, VkImageSubresourceRange const& range,
             VulkanLayout newLayout);
 
@@ -267,6 +298,8 @@ struct VulkanTexture : public HwTexture, fvkmemory::Resource {
     // happens.
     void setYcbcrConversion(VkSamplerYcbcrConversion conversion);
 
+    VkSamplerYcbcrConversion getYcbcrConversion() const { return mState->mYcbcr.conversion; }
+
 #if FVK_ENABLED(FVK_DEBUG_TEXTURE)
     void print() const;
 #endif
@@ -278,7 +311,7 @@ private:
             VkComponentMapping swizzle);
 
     void updateImageWithBlit(const PixelBufferDescriptor& hostData, uint32_t width, uint32_t height,
-            uint32_t depth, uint32_t miplevel);
+            uint32_t depth, uint32_t xoffset, uint32_t yoffset, uint32_t zoffset, uint32_t miplevel);
 
     fvkmemory::resource_ptr<VulkanTextureState> mState;
 

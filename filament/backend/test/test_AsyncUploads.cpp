@@ -15,7 +15,6 @@
  */
 
 #include "BackendTest.h"
-
 #include "ImageExpectations.h"
 #include "Lifetimes.h"
 #include "Shader.h"
@@ -38,6 +37,7 @@ struct AsyncState {
     bool bufferObjectCreated = false;
     bool textureCreated = false;
     bool textureViewSwizzledCreated = false;
+    bool vertexBufferCreated = false;
     bool indexBufferUpdated = false;
     bool bufferObjectUpdated = false;
     bool textureUpdated = false;
@@ -45,14 +45,32 @@ struct AsyncState {
     bool commandQueued = false;
 };
 
-static void signalCallback(void* user) {
+static void signalCallback(void* user, AsyncCallStatus const status) {
+    EXPECT_EQ(status, AsyncCallStatus::COMPLETED);
     bool* flag = static_cast<bool*>(user);
     *flag = true;
+}
+
+// Records the status instead of asserting on it, so that the assertion happens on the test thread.
+struct AsyncCallResult {
+    bool fired = false;
+    AsyncCallStatus status = AsyncCallStatus::COMPLETED;
+};
+
+static void recordCallback(void* user, AsyncCallStatus const status) {
+    AsyncCallResult* result = static_cast<AsyncCallResult*>(user);
+    result->status = status;
+    result->fired = true;
 }
 
 TEST_F(BackendTest, BasicAsyncFlow) {
     SKIP_IF(Backend::VULKAN, "Vulkan does not support asynchronous resource uploading");
     SKIP_IF(Backend::WEBGPU, "WebGPU does not support asynchronous resource uploading");
+#if defined(FILAMENT_IOS) && !defined(FILAMENT_IOS_SIMULATOR)
+    // A-series devices rasterize this scene differently from every other environment (measured
+    // 2793888331 on an A10X), so there is no single hash this can be compared against.
+    GTEST_SKIP() << "no golden hash for this scene on iOS-family device hardware";
+#endif
 
     constexpr int kRenderTargetSize = 512;
 
@@ -68,7 +86,7 @@ TEST_F(BackendTest, BasicAsyncFlow) {
                 .mUniformType = ShaderUniformType::Sampler,
             });
 
-    RenderPassParams params = getClearColorRenderPass();
+    RenderPassParams params = getClearColorDepthRenderPass();
     params.viewport = getFullViewport();
 
     PipelineState ps = getColorWritePipelineState();
@@ -157,7 +175,8 @@ TEST_F(BackendTest, BasicAsyncFlow) {
         .type = ElementType::FLOAT2,
         .flags = 0 } };
     VertexBufferInfoHandle vbih = addCleanup(api.createVertexBufferInfo(1, 1, attributes));
-    VertexBufferHandle vbh = addCleanup(api.createVertexBuffer(3, vbih));
+    VertexBufferHandle vbh = addCleanup(api.createVertexBufferAsync(3, vbih, nullptr,
+            signalCallback, &state.vertexBufferCreated));
 
     // Set Vertex Buffer Object Asynchronously
     api.setVertexBufferObjectAsync(vbh, 0, boh, nullptr, signalCallback, &state.vertexBufferSet);
@@ -173,6 +192,7 @@ TEST_F(BackendTest, BasicAsyncFlow) {
     waitFor(state.indexBufferUpdated);
     waitFor(state.bufferObjectUpdated);
     waitFor(state.textureUpdated);
+    waitFor(state.vertexBufferCreated);
     waitFor(state.vertexBufferSet);
     waitFor(state.commandQueued);
 
@@ -203,10 +223,193 @@ TEST_F(BackendTest, BasicAsyncFlow) {
         api.endRenderPass();
 
         EXPECT_IMAGE(renderTarget,
-                ScreenshotParams(kRenderTargetSize, kRenderTargetSize, "BasicAsyncFlow", 1));
+                ScreenshotParams(kRenderTargetSize, kRenderTargetSize, "BasicAsyncFlow",
+                        1079009730u));
 
         api.commit(swapChain);
     }
+}
+
+TEST_F(BackendTest, CanceledAsyncCallInvokesCallback) {
+    // The Vulkan backend does implement asynchronous uploading, but BackendTest only enables
+    // asynchronous mode for Metal and OpenGL (BackendTest.cpp), so there is no job queue here.
+    SKIP_IF(Backend::VULKAN, "the test harness does not enable asynchronous mode for Vulkan");
+    SKIP_IF(Backend::WEBGPU, "WebGPU does not support asynchronous resource uploading");
+
+    auto& api = getDriverApi();
+    auto swapChain = addCleanup(createSwapChain());
+    api.makeCurrent(swapChain, swapChain);
+
+    AsyncCallResult result;
+    bool commandRan = false;
+
+    auto waitFor = [&](const bool& flag) {
+        int attempts = 0;
+        while (!flag && attempts < 1000) {
+            api.finish();
+            executeCommands();
+            getDriver().purge();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            attempts++;
+        }
+        EXPECT_TRUE(flag);
+    };
+
+    // Only the first half of an asynchronous call runs here on the test thread, reserving the job
+    // id. The half that queues the actual job runs on the backend thread, when the command buffer
+    // below is executed, so the job is still cancelable at this point.
+    AsyncCallId const id = api.queueCommandAsync([&commandRan]() { commandRan = true; }, nullptr,
+            recordCallback, &result);
+    EXPECT_TRUE(api.cancelAsyncJob(id));
+
+    // A canceled call must still notify the caller, otherwise cancellation is indistinguishable
+    // from a call that is taking a long time, and whatever the callback owns is leaked.
+    waitFor(result.fired);
+    EXPECT_EQ(AsyncCallStatus::CANCELED, result.status)
+            << "a canceled call must report that it was canceled, not that it completed";
+    EXPECT_FALSE(commandRan) << "the canceled command must not have been executed";
+
+    // The job is gone, so canceling it a second time reports that there was nothing to cancel.
+    EXPECT_FALSE(api.cancelAsyncJob(id));
+}
+
+TEST_F(BackendTest, CanceledSetVertexBufferObjectAsyncInvokesCallback) {
+    SKIP_IF(Backend::VULKAN, "the test harness does not enable asynchronous mode for Vulkan");
+    SKIP_IF(Backend::WEBGPU, "WebGPU does not support asynchronous resource uploading");
+
+    auto& api = getDriverApi();
+    auto swapChain = addCleanup(createSwapChain());
+    api.makeCurrent(swapChain, swapChain);
+
+    auto waitFor = [&](const bool& flag) {
+        int attempts = 0;
+        while (!flag && attempts < 1000) {
+            api.finish();
+            executeCommands();
+            getDriver().purge();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            attempts++;
+        }
+        EXPECT_TRUE(flag);
+    };
+
+    AsyncState state;
+    AttributeArray attributes = { Attribute{ .offset = 0,
+        .stride = sizeof(float2),
+        .buffer = 0,
+        .type = ElementType::FLOAT2,
+        .flags = 0 } };
+    VertexBufferInfoHandle vbih = addCleanup(api.createVertexBufferInfo(1, 1, attributes));
+    VertexBufferHandle vbh = addCleanup(api.createVertexBufferAsync(3, vbih, nullptr,
+            signalCallback, &state.vertexBufferCreated));
+    BufferObjectHandle boh =
+            addCleanup(api.createBufferObjectAsync(sizeof(float2) * 3, BufferObjectBinding::VERTEX,
+                    BufferUsage::STATIC, nullptr, signalCallback, &state.bufferObjectCreated));
+    waitFor(state.vertexBufferCreated);
+    waitFor(state.bufferObjectCreated);
+
+    // Same race as above. This call is worth its own test because the Metal backend doesn't run
+    // it on a job, it only sets a pointer on the backend thread, so both honoring the cancellation
+    // and releasing the reserved id are done by hand there.
+    AsyncCallResult result;
+    AsyncCallId const id = api.setVertexBufferObjectAsync(vbh, 0, boh, nullptr, recordCallback,
+            &result);
+    EXPECT_TRUE(api.cancelAsyncJob(id));
+
+    waitFor(result.fired);
+    EXPECT_EQ(AsyncCallStatus::CANCELED, result.status)
+            << "a canceled call must report that it was canceled, not that it completed";
+    EXPECT_FALSE(api.cancelAsyncJob(id));
+}
+
+TEST_F(BackendTest, DestroyAfterAsyncUpdatePreservesFifo) {
+    SKIP_IF(Backend::VULKAN, "the test harness does not enable asynchronous mode for Vulkan");
+    SKIP_IF(Backend::WEBGPU, "WebGPU does not support asynchronous resource uploading");
+
+    auto& api = getDriverApi();
+    auto swapChain = addCleanup(createSwapChain());
+    api.makeCurrent(swapChain, swapChain);
+
+    struct Callbacks {
+        bool ibUpdated = false;
+        bool boUpdated = false;
+        bool texUpdated = false;
+        bool vbSet = false;
+    } callbacks;
+
+    auto waitFor = [&](const bool& flag) {
+        int attempts = 0;
+        while (!flag && attempts < 1000) {
+            api.finish();
+            executeCommands();
+            getDriver().purge();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            attempts++;
+        }
+        EXPECT_TRUE(flag);
+    };
+
+    // Create resources synchronously (asynchronous == false in backend).
+    IndexBufferHandle ibh = api.createIndexBuffer(ElementType::UINT, 3, BufferUsage::STATIC);
+    BufferObjectHandle boh = api.createBufferObject(sizeof(float2) * 3,
+            BufferObjectBinding::VERTEX, BufferUsage::STATIC);
+    TextureHandle th = api.createTexture(SamplerType::SAMPLER_2D, 1, TextureFormat::RGBA8, 1,
+            2, 2, 1, TextureUsage::DEFAULT);
+
+    AttributeArray attributes = { Attribute{
+        .offset = 0,
+        .stride = sizeof(float2),
+        .buffer = 0,
+        .type = ElementType::FLOAT2,
+        .flags = 0
+    } };
+    VertexBufferInfoHandle vbih = api.createVertexBufferInfo(1, 1, attributes);
+    VertexBufferHandle vbh = api.createVertexBuffer(3, vbih);
+    BufferObjectHandle boh2 = api.createBufferObject(sizeof(float2) * 3,
+            BufferObjectBinding::VERTEX, BufferUsage::STATIC);
+
+    // Enqueue async updates on synchronously created resources.
+    uint32_t* indices = (uint32_t*) malloc(sizeof(uint32_t) * 3);
+    indices[0] = 0;
+    indices[1] = 1;
+    indices[2] = 2;
+    BufferDescriptor indexData(indices, sizeof(uint32_t) * 3,
+            [](void* buffer, size_t, void*) { free(buffer); });
+    api.updateIndexBufferAsync(ibh, std::move(indexData), 0, nullptr, signalCallback,
+            &callbacks.ibUpdated);
+
+    float2* vertices = (float2*) malloc(sizeof(float2) * 3);
+    vertices[0] = { -1.0, -1.0 };
+    vertices[1] = { 1.0, -1.0 };
+    vertices[2] = { -1.0, 1.0 };
+    BufferDescriptor vertexData(vertices, sizeof(float2) * 3,
+            [](void* buffer, size_t, void*) { free(buffer); });
+    api.updateBufferObjectAsync(boh, std::move(vertexData), 0, nullptr, signalCallback,
+            &callbacks.boUpdated);
+
+    uint32_t* texData = (uint32_t*) malloc(sizeof(uint32_t) * 4);
+    for (int i = 0; i < 4; ++i) {
+        texData[i] = 0xFFFFFFFF;
+    }
+    PixelBufferDescriptor pixelData(texData, sizeof(uint32_t) * 4, PixelDataFormat::RGBA,
+            PixelDataType::UBYTE, [](void* buffer, size_t, void*) { free(buffer); });
+    api.update3DImageAsync(th, 0, 0, 0, 0, 2, 2, 1, std::move(pixelData), nullptr, signalCallback,
+            &callbacks.texUpdated);
+
+    api.setVertexBufferObjectAsync(vbh, 0, boh2, nullptr, signalCallback, &callbacks.vbSet);
+
+    // Destroy immediately: must be routed through JobQueue to preserve FIFO ordering after updates.
+    api.destroyIndexBuffer(ibh);
+    api.destroyBufferObject(boh);
+    api.destroyTexture(th);
+    api.destroyVertexBuffer(vbh);
+    api.destroyBufferObject(boh2);
+    api.destroyVertexBufferInfo(vbih);
+
+    waitFor(callbacks.ibUpdated);
+    waitFor(callbacks.boUpdated);
+    waitFor(callbacks.texUpdated);
+    waitFor(callbacks.vbSet);
 }
 
 } // namespace test

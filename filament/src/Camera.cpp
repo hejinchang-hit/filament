@@ -18,10 +18,9 @@
 
 #include <filament/Camera.h>
 
-#include <math/mat4.h>
-
 #include <utils/Panic.h>
 
+#include <math/mat4.h>
 #include <math/vec2.h>
 #include <math/vec3.h>
 #include <math/vec4.h>
@@ -71,9 +70,9 @@ void Camera::setEyeModelMatrix(uint8_t const eyeId, mat4 const& model) {
     downcast(this)->setEyeModelMatrix(eyeId, model);
 }
 
-void Camera::setCustomEyeProjection(mat4 const* projection, size_t const count,
+void Camera::setCustomEyeProjection(utils::Slice<const mat4> projection,
         mat4 const& projectionForCulling, double const near, double const far) {
-    downcast(this)->setCustomEyeProjection(projection, count, projectionForCulling, near, far);
+    downcast(this)->setCustomEyeProjection(projection, projectionForCulling, near, far);
 }
 
 void Camera::setProjection(Projection const projection, double const left, double const right, double const bottom,
@@ -140,6 +139,10 @@ mat4 Camera::getModelMatrix() const noexcept {
 
 mat4 Camera::getViewMatrix() const noexcept {
     return downcast(this)->getViewMatrix();
+}
+
+mat4 Camera::getEyeFromViewMatrix(uint8_t const eyeId) const noexcept {
+    return downcast(this)->getEyeFromViewMatrix(eyeId);
 }
 
 double3 Camera::getPosition() const noexcept {

@@ -17,17 +17,18 @@
 #ifndef TNT_FILAMENT_BACKEND_PRIVATE_JOBQUEUE_H
 #define TNT_FILAMENT_BACKEND_PRIVATE_JOBQUEUE_H
 
+#include <utils/compiler.h>
+#include <utils/Condition.h>
 #include <utils/FixedCapacityVector.h>
 #include <utils/Invocable.h>
 #include <utils/JobSystem.h>
+#include <utils/Mutex.h>
 
-#include <mutex>
-#include <condition_variable>
-#include <thread>
-#include <memory>
-#include <unordered_map>
 #include <limits>
+#include <memory>
 #include <queue>
+#include <thread>
+#include <unordered_map>
 
 namespace filament::backend {
 
@@ -83,11 +84,15 @@ public:
 
     explicit JobQueue(PassKey); // This can be created only via `create()`
 
+    // Debug builds assert that every id issued by `issueJobId()` was pushed or canceled.
+    ~JobQueue();
+
     /**
      * Pushes a new job into queue.
      *
-     * If the queue is in the process of shutting down (via a call to `stop`), this method does
-     * nothing (a no-op) and returns an invalid job ID.
+     * If the queue is in the process of shutting down (via a call to `stop`), the job is not
+     * queued but destroyed on the calling thread. Also, this method returns `InvalidJobId`, and a
+     * placeholder for a valid `preIssuedJobId` is cleaned up internally.
      *
      * @param job The function/lambda to be executed.
      * @param preIssuedJobId The previously issued job ID where this job is assigned to.
@@ -136,6 +141,10 @@ public:
     /**
      * Cancels a job by its ID.
      *
+     * The canceled job is destroyed on the calling thread, without the queue's lock held, so it is
+     * safe for the job (or anything it captured) to call back into this queue while being
+     * destroyed.
+     *
      * @param jobId The job ID to cancel.
      * @return true if the job was found and cancelled, false otherwise.
      */
@@ -151,14 +160,14 @@ private:
     JobQueue(const JobQueue&) = delete;
     JobQueue& operator=(const JobQueue&) = delete;
 
-    JobId genNextJobId() noexcept;
+    JobId genNextJobId() noexcept UTILS_REQUIRES(mQueueMutex);
 
-    std::mutex mQueueMutex;
-    std::condition_variable mQueueCondition;
-    std::unordered_map<JobId, Job> mJobsMap;
-    std::queue<JobId> mJobOrder;
-    JobId mNextJobId = 0;
-    bool mIsStopping = false;
+    utils::Mutex mQueueMutex;
+    utils::Condition mQueueCondition;
+    std::unordered_map<JobId, Job> mJobsMap UTILS_GUARDED_BY(mQueueMutex);
+    std::queue<JobId> mJobOrder UTILS_GUARDED_BY(mQueueMutex);
+    JobId mNextJobId UTILS_GUARDED_BY(mQueueMutex) = 0;
+    bool mIsStopping UTILS_GUARDED_BY(mQueueMutex) = false;
 };
 
 /**

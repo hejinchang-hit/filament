@@ -16,16 +16,19 @@
 
 #include "VulkanPlatformSwapChainImpl.h"
 
-#include "vulkan/VulkanConstants.h"
+#ifdef __ANDROID__
+#include "AndroidNativeWindow.h"
+#endif
+
 #include "vulkan/utils/Definitions.h"
 #include "vulkan/utils/Helper.h"
 #include "vulkan/utils/Image.h"
+#include "vulkan/VulkanConstants.h"
 
 #include <backend/DriverEnums.h>
 
-#ifdef __ANDROID__
-#include <AndroidNativeWindow.h>
-#endif
+#include <errno.h>
+
 
 using namespace bluevk;
 using namespace utils;
@@ -132,13 +135,18 @@ bool VulkanPlatformSwapChainBase::queryCompositorTiming(
     return false;
 }
 
-bool VulkanPlatformSwapChainBase::setPresentFrameId(uint64_t frameId) const {
-    return false;
-}
+bool VulkanPlatformSwapChainBase::setPresentFrameId(uint64_t frameId) const { return false; }
+
+void VulkanPlatformSwapChainBase::setPresentationTime(int64_t frameId) noexcept {}
 
 bool VulkanPlatformSwapChainBase::queryFrameTimestamps(uint64_t frameId,
         FrameTimestamps* outFrameTimestamps) const {
     return false;
+}
+
+int VulkanPlatformSwapChainBase::setFrameRate(float,
+        Platform::FrameRateCompatibility, Platform::ChangeFrameRateStrategy) const {
+    return 0;
 }
 
 VulkanPlatformSurfaceSwapChain::VulkanPlatformSurfaceSwapChain(VulkanContext const& context,
@@ -158,16 +166,20 @@ VulkanPlatformSurfaceSwapChain::VulkanPlatformSurfaceSwapChain(VulkanContext con
 }
 
 VulkanPlatformSurfaceSwapChain::~VulkanPlatformSurfaceSwapChain() {
-    destroy();
+    VulkanPlatformSurfaceSwapChain::destroy();
     vkDestroySurfaceKHR(mInstance, mSurface, VKALLOC);
 }
 
 VkResult VulkanPlatformSurfaceSwapChain::create() {
+    if (UTILS_VERY_UNLIKELY(mSurfaceLost)) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+
 #ifdef __ANDROID__
     NativeWindow::enableFrameTimestamps(static_cast<ANativeWindow*>(mNativeWindow), true);
     // on Android, disable producer throttling
-    if (mProducerThrottling.isSupported()) {
-        mProducerThrottling.setProducerThrottlingEnabled(
+    if (NativeWindow::isProducerThrottlingSupported()) {
+        NativeWindow::setProducerThrottlingEnabled(
                 static_cast<ANativeWindow*>(mNativeWindow), false);
     }
 #endif
@@ -196,6 +208,13 @@ VkResult VulkanPlatformSurfaceSwapChain::create() {
     // Find a suitable surface format.
     FixedCapacityVector<VkSurfaceFormatKHR> const surfaceFormats
             = fvkutils::enumerate(vkGetPhysicalDeviceSurfaceFormatsKHR, mPhysicalDevice, mSurface);
+
+    // We could get no surface formats if the we've gotten a VK_ERROR_SURFACE_LOST_KHR.
+    if (UTILS_VERY_UNLIKELY(surfaceFormats.empty())) {
+        mSurfaceLost = true;
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+
     std::array<VkFormat, 2> expectedFormats = {
         VK_FORMAT_R8G8B8A8_UNORM,
         VK_FORMAT_B8G8R8A8_UNORM,
@@ -221,6 +240,12 @@ VkResult VulkanPlatformSurfaceSwapChain::create() {
     VkPresentModeKHR const desiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     FixedCapacityVector<VkPresentModeKHR> presentModes = fvkutils::enumerate(
             vkGetPhysicalDeviceSurfacePresentModesKHR, mPhysicalDevice, mSurface);
+
+    // We will have no present modes if the we've gotten a VK_ERROR_SURFACE_LOST_KHR.
+    if (UTILS_VERY_UNLIKELY(presentModes.empty())) {
+        mSurfaceLost = true;
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     bool const foundSuitablePresentMode = std::find(presentModes.begin(), presentModes.end(),
                                             desiredPresentMode) != presentModes.end();
@@ -270,8 +295,12 @@ VkResult VulkanPlatformSurfaceSwapChain::create() {
             .oldSwapchain = mSwapchain,
     };
     VkResult result = vkCreateSwapchainKHR(mDevice, &createInfo, VKALLOC, &mSwapchain);
-    FILAMENT_CHECK_POSTCONDITION(result == VK_SUCCESS) << "vkCreateSwapchainKHR failed."
-                                                       << " error=" << static_cast<int32_t>(result);
+
+    if (UTILS_VERY_UNLIKELY(result != VK_SUCCESS)) {
+        mSurfaceLost = true;
+        LOG(ERROR) << "vkCreateSwapchainKHR failed. error=" << static_cast<int32_t>(result);
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     mSwapChainBundle.colors = fvkutils::enumerate(vkGetSwapchainImagesKHR, mDevice, mSwapchain);
     mSwapChainBundle.colorFormat = surfaceFormat.format;
@@ -305,6 +334,10 @@ VkResult VulkanPlatformSurfaceSwapChain::create() {
 }
 
 VkResult VulkanPlatformSurfaceSwapChain::acquire(VulkanPlatform::ImageSyncData* outImageSyncData) {
+    if (UTILS_VERY_UNLIKELY(mSurfaceLost)) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+
     mCurrentImageReadyIndex = (mCurrentImageReadyIndex + 1) % IMAGE_READY_SEMAPHORE_COUNT;
     outImageSyncData->imageReadySemaphore = mImageReady[mCurrentImageReadyIndex];
     VkResult result = vkAcquireNextImageKHR(mDevice, mSwapchain, UINT64_MAX,
@@ -316,20 +349,46 @@ VkResult VulkanPlatformSurfaceSwapChain::acquire(VulkanPlatform::ImageSyncData* 
         FVK_LOGW << "Vulkan Driver: Suboptimal swap chain.";
         mSuboptimal = true;
     }
+
+    if (UTILS_VERY_UNLIKELY(result == VK_ERROR_SURFACE_LOST_KHR)) {
+        mSurfaceLost = true;
+    }
+
     return result;
 }
 
 VkResult VulkanPlatformSurfaceSwapChain::present(uint32_t index, VkSemaphore finished) {
+    if (UTILS_VERY_UNLIKELY(mSurfaceLost)) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+
     uint32_t currentIndex = index;
     VkSemaphore finishedDrawing = finished;
-    VkPresentInfoKHR presentInfo{
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &finishedDrawing,
-            .swapchainCount = 1,
-            .pSwapchains = &mSwapchain,
-            .pImageIndices = &currentIndex,
+
+    VkPresentTimeGOOGLE presentTime = {
+        .presentID = mArbitraryFrameId++,
+        .desiredPresentTime = uint64_t(mPresentationTime),
     };
+
+    VkPresentTimesInfoGOOGLE presentTimeInfoGoogle = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE,
+        .swapchainCount = 1,
+        .pTimes = &presentTime,
+    };
+
+    VkPresentInfoKHR presentInfo = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &finishedDrawing,
+        .swapchainCount = 1,
+        .pSwapchains = &mSwapchain,
+        .pImageIndices = &currentIndex,
+    };
+
+    if (mContext.isGoogleDisplayTimingEnabled() && mPresentationTime != 0) {
+        presentInfo.pNext = &presentTimeInfoGoogle;
+    }
+
     VkResult result = vkQueuePresentKHR(mQueue, &presentInfo);
 
     // On Android Q and above, a suboptimal surface is always reported after screen rotation:
@@ -338,12 +397,28 @@ VkResult VulkanPlatformSurfaceSwapChain::present(uint32_t index, VkSemaphore fin
         FVK_LOGW << "Vulkan Driver: Suboptimal swap chain.";
         mSuboptimal = true;
     }
+    if (UTILS_VERY_UNLIKELY(result == VK_ERROR_SURFACE_LOST_KHR)) {
+        mSurfaceLost = true;
+    }
+
     return result;
 }
 
 bool VulkanPlatformSurfaceSwapChain::hasResized() const {
+    if (UTILS_VERY_UNLIKELY(mSurfaceLost)) {
+        // We return "false" here to indicate that we're in a bad state and will not trigger the
+        // recreate path.
+        return false;
+    }
+
     VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(mPhysicalDevice, mSurface, &caps);
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(mPhysicalDevice, mSurface, &caps);
+
+    if (UTILS_VERY_UNLIKELY(result == VK_ERROR_SURFACE_LOST_KHR)) {
+        mSurfaceLost = true;
+        return false;
+    }
+
     VkExtent2D perceivedExtent = caps.currentExtent;
     // Create the low-level swap chain.
     if (perceivedExtent.width == VULKAN_UNDEFINED_EXTENT
@@ -357,14 +432,26 @@ bool VulkanPlatformSurfaceSwapChain::isProtected() const {
     return mIsProtected;
 }
 
+int VulkanPlatformSurfaceSwapChain::setFrameRate(float const frameRate,
+        Platform::FrameRateCompatibility const compatibility,
+        Platform::ChangeFrameRateStrategy const strategy) const {
+#ifdef __ANDROID__
+    return mNativeWindow ? NativeWindow::setFrameRate(
+            static_cast<ANativeWindow*>(mNativeWindow), frameRate, compatibility, strategy) : -ENOSYS;
+#else
+    return 0;
+#endif
+}
+
 bool VulkanPlatformSurfaceSwapChain::queryCompositorTiming(
         CompositorTiming* outCompositorTiming) const {
 #ifdef __ANDROID__
     // fallback to private APIs
     if (UTILS_VERY_LIKELY(mNativeWindow)) {
+        CompositorTiming::duration_ns dummyCompositeDeadlineLatency;
         int const status = NativeWindow::getCompositorTiming(
                 static_cast<ANativeWindow*>(mNativeWindow),
-                &outCompositorTiming->compositeDeadline,
+                &dummyCompositeDeadlineLatency,
                 &outCompositorTiming->compositeInterval,
                 &outCompositorTiming->compositeToPresentLatency);
         if (status == 0) {
@@ -380,6 +467,10 @@ bool VulkanPlatformSurfaceSwapChain::setPresentFrameId(uint64_t frameId) const {
     return mImpl.setPresentFrameId(static_cast<ANativeWindow*>(mNativeWindow), frameId);
 #endif
     return VulkanPlatformSwapChainBase::setPresentFrameId(frameId);
+}
+
+void VulkanPlatformSurfaceSwapChain::setPresentationTime(int64_t presentationTime) noexcept {
+    mPresentationTime = presentationTime;
 }
 
 bool VulkanPlatformSurfaceSwapChain::queryFrameTimestamps(uint64_t const frameId,
@@ -468,7 +559,7 @@ VulkanPlatformHeadlessSwapChain::VulkanPlatformHeadlessSwapChain(VulkanContext c
 }
 
 VulkanPlatformHeadlessSwapChain::~VulkanPlatformHeadlessSwapChain() {
-    destroy();
+    VulkanPlatformHeadlessSwapChain::destroy();
 }
 
 VkResult VulkanPlatformHeadlessSwapChain::present(uint32_t index, VkSemaphore finished) {
@@ -480,6 +571,15 @@ VkResult VulkanPlatformHeadlessSwapChain::acquire(VulkanPlatform::ImageSyncData*
     outImageSyncData->imageIndex = mCurrentIndex;
     mCurrentIndex = (mCurrentIndex + 1) % HEADLESS_SWAPCHAIN_SIZE;
     return VK_SUCCESS;
+}
+
+int VulkanPlatformHeadlessSwapChain::setFrameRate(float,
+        Platform::FrameRateCompatibility, Platform::ChangeFrameRateStrategy) const {
+#ifdef __ANDROID__
+    return -ENOSYS;
+#else
+    return 0;
+#endif
 }
 
 void VulkanPlatformHeadlessSwapChain::destroy() {

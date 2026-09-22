@@ -17,10 +17,10 @@
 #include "VulkanDescriptorSetCache.h"
 
 #include "VulkanCommands.h"
-#include "VulkanHandles.h"
 #include "VulkanConstants.h"
-#include "utils/compiler.h"
+#include "VulkanHandles.h"
 
+#include <utils/compiler.h>
 #include <utils/FixedCapacityVector.h>
 #include <utils/Panic.h>
 
@@ -339,7 +339,10 @@ void VulkanDescriptorSetCache::updateBuffer(fvkmemory::resource_ptr<VulkanDescri
     };
     VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
-    if (set->dynamicUboMask.test(binding)) {
+    if (set->dynamicUboMask.test(
+                binding + fvkutils::getVertexStageShift<fvkutils::UniformBufferBitmask>()) ||
+            set->dynamicUboMask.test(
+                    binding + fvkutils::getFragmentStageShift<fvkutils::UniformBufferBitmask>())) {
         type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     }
     VkWriteDescriptorSet descriptorWrite = {
@@ -356,7 +359,7 @@ void VulkanDescriptorSetCache::updateBuffer(fvkmemory::resource_ptr<VulkanDescri
 
 void VulkanDescriptorSetCache::updateSampler(fvkmemory::resource_ptr<VulkanDescriptorSet> set,
         uint8_t binding, fvkmemory::resource_ptr<VulkanTexture> texture,
-        VkSampler sampler, VkDescriptorSetLayout externalSamplerLayout) noexcept {
+        VkSampler sampler) noexcept {
     VkDescriptorSet const vkset = set->getVkSet();
     VkImageSubresourceRange range = texture->getPrimaryViewRange();
     VkImageViewType const expectedType = texture->getViewType();

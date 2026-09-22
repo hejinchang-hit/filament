@@ -29,6 +29,7 @@
 #include <QuartzCore/QuartzCore.h>
 
 #include <utils/FixedCircularBuffer.h>
+#include <utils/Mutex.h>
 
 #include <array>
 #include <atomic>
@@ -45,13 +46,19 @@ namespace filament {
 namespace backend {
 
 class MetalDriver;
+
+struct DriverLifetimeTracker {
+    utils::Mutex mutex;
+    MetalDriver* driver = nullptr;
+};
+
 class MetalBlitter;
 class MetalBufferPool;
 class MetalBumpAllocator;
 class MetalRenderTarget;
 class MetalSwapChain;
 class MetalTexture;
-class MetalTimerQueryInterface;
+class MetalTimerQueryImpl;
 struct MetalUniformBuffer;
 struct MetalIndexBuffer;
 struct MetalVertexBuffer;
@@ -210,12 +217,13 @@ struct MetalContext {
     // Fences, only supported on macOS 10.14 and iOS 12 and above.
     API_AVAILABLE(macos(10.14), ios(12.0))
     MTLSharedEventListener* eventListener = nil;
+    std::shared_ptr<DriverLifetimeTracker> driverLifetimeTracker;
     // signalId is incremented in the MetalFence constructor, which is called on
-    // both the driver (MetalTimerQueryFence::beginTimeElapsedQuery) and main
+    // both the driver (MetalFence::encode) and main
     // threads (in createFenceS), so an atomic is necessary.
     std::atomic<uint64_t> signalId = 1;
 
-    MetalTimerQueryInterface* timerQueryImpl;
+    MetalTimerQueryImpl* timerQueryImpl;
 
     std::stack<const char*> groupMarkers;
 

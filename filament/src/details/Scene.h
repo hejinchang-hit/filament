@@ -17,30 +17,35 @@
 #ifndef TNT_FILAMENT_DETAILS_SCENE_H
 #define TNT_FILAMENT_DETAILS_SCENE_H
 
-#include "downcast.h"
-
 #include "Allocators.h"
 #include "Culler.h"
-
-#include "ds/DescriptorSet.h"
+#include "downcast.h"
 
 #include "components/LightManager.h"
 #include "components/RenderableManager.h"
 
+#include "ds/DescriptorSet.h"
+
+#include <private/filament/EngineEnums.h>
+
 #include <filament/Scene.h>
 
 #include <utils/Entity.h>
+#include <utils/PagedArenaBitset.h>
+#include <utils/Range.h>
 #include <utils/Slice.h>
 #include <utils/StructureOfArrays.h>
-#include <utils/Range.h>
+
+#include <array>
+#include <unordered_map>
+#include <vector>
 
 #include <stddef.h>
-
-#include <tsl/robin_set.h>
 
 namespace filament {
 
 struct CameraInfo;
+class FView;
 class FEngine;
 class FIndirectLight;
 class FRenderer;
@@ -48,6 +53,8 @@ class FSkybox;
 
 class FScene : public Scene {
 public:
+    struct SceneCacheData;
+
     /*
      * Filament-scope Public API
      */
@@ -64,13 +71,13 @@ public:
     ~FScene() noexcept;
     void terminate(FEngine& engine);
 
-    void prepare(utils::JobSystem& js, RootArenaScope& rootArenaScope,
-            math::mat4 const& worldTransform, bool shadowReceiversAreCasters) noexcept;
+    void prepare(utils::JobSystem& js, LinearAllocatorArena& arena,
+            math::mat4 const& worldTransform, bool shadowReceiversAreCasters, SceneCacheData& cache) noexcept;
 
-    void prepareVisibleRenderables(utils::Range<uint32_t> visibleRenderables) noexcept;
+    void prepareVisibleRenderables(utils::Range<uint32_t> visibleRenderables, SceneCacheData& cache) const noexcept;
 
     void prepareDynamicLights(const CameraInfo& camera,
-            backend::Handle<backend::HwBufferObject> lightUbh) noexcept;
+            backend::Handle<backend::HwBufferObject> lightUbh, SceneCacheData& cache) noexcept;
 
     /*
      * Storage for per-frame renderable data
@@ -79,7 +86,7 @@ public:
     using VisibleMaskType = Culler::result_type;
 
     enum {
-        RENDERABLE_INSTANCE,    //   4 | instance of the Renderable component
+        RENDERABLE_ENTITY,      //   4 | Entity of the Renderable component
         WORLD_TRANSFORM,        //  16 | instance of the Transform component
         VISIBILITY_STATE,       //   2 | visibility data of the component
         SKINNING_STATE,         //   1 | skinning data of the component
@@ -94,6 +101,14 @@ public:
         LAYERS,                 //   1 | layers
         WORLD_AABB_EXTENT,      //  12 | world-space bounding box half-extent of the renderable
 
+        // Planar bounding box coordinates for high-throughput vectorized culling
+        WORLD_AABB_CENTER_X,    //   4 | center.x
+        WORLD_AABB_CENTER_Y,    //   4 | center.y
+        WORLD_AABB_CENTER_Z,    //   4 | center.z
+        WORLD_AABB_EXTENT_X,    //   4 | halfExtent.x
+        WORLD_AABB_EXTENT_Y,    //   4 | halfExtent.y
+        WORLD_AABB_EXTENT_Z,    //   4 | halfExtent.z
+
         // These are temporaries and should be stored out of line
         PRIMITIVES,             //   8 | level-of-detail'ed primitives
         SUMMED_PRIMITIVE_COUNT, //   4 | summed visible primitive counts
@@ -105,7 +120,7 @@ public:
     };
 
     using RenderableSoa = utils::StructureOfArrays<
-            utils::EntityInstance<RenderableManager>,   // RENDERABLE_INSTANCE
+            utils::Entity,                              // RENDERABLE_ENTITY
             math::mat4f,                                // WORLD_TRANSFORM
             FRenderableManager::Visibility,             // VISIBILITY_STATE
             FRenderableManager::Skinning,               // SKINNING_STATE
@@ -117,6 +132,12 @@ public:
             uint8_t,                                    // CHANNELS
             uint8_t,                                    // LAYERS
             math::float3,                               // WORLD_AABB_EXTENT
+            float,                                      // WORLD_AABB_CENTER_X
+            float,                                      // WORLD_AABB_CENTER_Y
+            float,                                      // WORLD_AABB_CENTER_Z
+            float,                                      // WORLD_AABB_EXTENT_X
+            float,                                      // WORLD_AABB_EXTENT_Y
+            float,                                      // WORLD_AABB_EXTENT_Z
             utils::Slice<const FRenderPrimitive>,       // PRIMITIVES
             uint32_t,                                   // SUMMED_PRIMITIVE_COUNT
             PerRenderableData,                          // UBO
@@ -125,8 +146,9 @@ public:
             float                                       // USER_DATA
     >;
 
-    RenderableSoa const& getRenderableData() const noexcept { return mRenderableData; }
-    RenderableSoa& getRenderableData() noexcept { return mRenderableData; }
+    
+
+    bool hasContactShadows(SceneCacheData const& cache) const noexcept;
 
     static uint32_t getPrimitiveCount(RenderableSoa const& soa,
             uint32_t const first, uint32_t const last) noexcept {
@@ -155,10 +177,15 @@ public:
 
     enum {
         POSITION_RADIUS,
+        POSITION_X,
+        POSITION_Y,
+        POSITION_Z,
+        RADIUS,
         DIRECTION,
         SHADOW_DIRECTION,
         SHADOW_REF,
-        LIGHT_INSTANCE,
+        LIGHT_ENTITY,
+        SPOT_PARAMS,
         VISIBILITY,
         SCREEN_SPACE_Z_RANGE,
         SHADOW_INFO
@@ -166,28 +193,44 @@ public:
 
     using LightSoa = utils::StructureOfArrays<
             math::float4,
+            float,
+            float,
+            float,
+            float,
             math::float3,
             math::float3,
             math::double2,
-            FLightManager::Instance,
+            utils::Entity,
+            math::float2,
             Culler::result_type,
             math::float2,
             ShadowInfo
     >;
 
-    LightSoa const& getLightData() const noexcept { return mLightData; }
-    LightSoa& getLightData() noexcept { return mLightData; }
-
-    bool hasContactShadows() const noexcept;
+    struct SceneCacheData {
+        RenderableSoa renderableData;
+        LightSoa lightData;
+        // Directional lights in addition to the dominant one (which is stored at index 0 of
+        // lightData). These are evaluated without shadows, so we only need their direction
+        // and LightManager instance.
+        std::array<math::float3, CONFIG_MAX_EXTRA_DIRECTIONAL_LIGHTS>
+                extraDirectionalLightDirections{};
+        std::array<FLightManager::Instance, CONFIG_MAX_EXTRA_DIRECTIONAL_LIGHTS>
+                extraDirectionalLightInstances{};
+        uint8_t extraDirectionalLightCount = 0;
+        bool hasContactShadows = false;
+    };
 
 private:
+    using EntitySet = utils::PagedArenaBitset;
+
     friend class Scene;
     void setSkybox(FSkybox* skybox) noexcept;
     void setIndirectLight(FIndirectLight* ibl) noexcept { mIndirectLight = ibl; }
     void addEntity(utils::Entity entity);
-    void addEntities(const utils::Entity* entities, size_t count);
+    void addEntities(utils::Slice<const utils::Entity> entities);
     void remove(utils::Entity entity);
-    void removeEntities(const utils::Entity* entities, size_t count);
+    void removeEntities(utils::Slice<const utils::Entity> entities);
     void removeAllEntities() noexcept;
     size_t getEntityCount() const noexcept { return mEntities.size(); }
     size_t getRenderableCount() const noexcept;
@@ -203,22 +246,16 @@ private:
     FIndirectLight* mIndirectLight = nullptr;
 
     /*
-     * list of Entities in the scene. We use a robin_set<> so we can do efficient removes
-     * (a vector<> could work, but removes would be O(n)). robin_set<> iterates almost as
-     * nicely as vector<>, which is a good compromise.
-     */
-    tsl::robin_set<utils::Entity, utils::Entity::Hasher> mEntities;
-
-
-    /*
      * The data below is valid only during a view pass. i.e. if a scene is used in multiple
      * views, the data below is updated for each view.
      * In essence, this data should be owned by View, but it's so scene-specific, that for now
      * we store it here.
      */
-    RenderableSoa mRenderableData;
-    LightSoa mLightData;
-    bool mHasContactShadows = false;
+    friend class FView;
+    void registerView(FView* view) noexcept;
+    void unregisterView(FView* view) noexcept;
+    std::vector<FView*> mRegisteredViews;
+    EntitySet mEntities;
 };
 
 FILAMENT_DOWNCAST(Scene)

@@ -16,21 +16,20 @@
 
 #include "GLMemoryMappedBuffer.h"
 
+#include "gl_headers.h"
 #include "GLBufferObject.h"
 #include "GLUtils.h"
 #include "OpenGLDriver.h"
 #include "OpenGLState.h"
-
-#include "gl_headers.h"
 
 #include <private/backend/HandleAllocator.h>
 
 #include <backend/DriverEnums.h>
 #include <backend/Handle.h>
 
+#include <utils/BitmaskEnum.h>
 #include <utils/compiler.h>
 #include <utils/debug.h>
-#include <utils/BitmaskEnum.h>
 
 #include <limits>
 #include <utility>
@@ -116,8 +115,8 @@ void GLMemoryMappedBuffer::unmap(OpenGLState& gls, HandleAllocatorGL& handleAllo
     }
 
 #ifndef FILAMENT_SILENCE_NOT_SUPPORTED_BY_ES2
-    gls.bindBuffer(gl.binding, gl.id);
 #   if !defined(__EMSCRIPTEN__)
+        gls.bindBuffer(gl.binding, gl.id);
         // don't unmap if we don't have a mapping or it didn't work
         if (UTILS_LIKELY(gl.vaddr)) {
             if (UTILS_UNLIKELY(glUnmapBuffer(gl.binding) == GL_FALSE)) {

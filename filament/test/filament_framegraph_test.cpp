@@ -14,20 +14,18 @@
  * limitations under the License.
  */
 
-#include <gtest/gtest.h>
-
 #include "TextureCache.h"
 
 #include "details/Texture.h"
 
+#include "fg/details/DependencyGraph.h"
 #include "fg/FrameGraph.h"
 #include "fg/FrameGraphId.h"
 #include "fg/FrameGraphResources.h"
 #include "fg/FrameGraphTexture.h"
-#include "fg/details/DependencyGraph.h"
 
-#include <private/backend/CommandStream.h>
 #include <private/backend/CircularBuffer.h>
+#include <private/backend/CommandStream.h>
 #include <private/backend/PlatformFactory.h>
 
 #include <backend/DriverEnums.h>
@@ -36,6 +34,8 @@
 
 #include <utils/Logger.h>
 #include <utils/StaticString.h>
+
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
@@ -47,6 +47,7 @@ class MockResourceAllocator final : public TextureCacheInterface {
     uint32_t handle = 0;
     struct MockDisposer final : public TextureCacheDisposerInterface {
         void destroy(TextureHandle) noexcept override {}
+        void removeTextureCache(TextureCacheInterface*) noexcept override {}
     } disposer;
 
 public:
@@ -75,10 +76,6 @@ public:
 
     void destroyTexture(TextureHandle h) noexcept override {
     }
-
-    TextureCacheDisposerInterface& getDisposer() noexcept override {
-        return disposer;
-    }
 };
 
 class FrameGraphTest : public testing::Test {
@@ -90,6 +87,8 @@ protected:
         //utils::io::sstream graphviz;
         //fg.export_graphviz(graphviz);
         //DLOG(INFO) << graphviz.c_str();
+
+        PlatformFactory::destroy(&platform);
     }
 
     Backend backend = Backend::NOOP;
@@ -97,7 +96,20 @@ protected:
     Platform* platform = PlatformFactory::create(&backend);
     CommandStream driverApi = CommandStream{ *platform->createDriver(nullptr, {}), buffer };
     MockResourceAllocator resourceAllocator;
-    FrameGraph fg{resourceAllocator};
+    LinearAllocatorArena arena{"FrameGraph Test Arena", 1024 * 1024};
+    FrameGraph fg{arena, 1024 * 1024, resourceAllocator};
+};
+
+class DependencyGraphTest : public testing::Test {
+protected:
+    void SetUp() override {
+    }
+
+    void TearDown() override {
+    }
+
+    LinearAllocatorArena rootArena{"DependencyGraphTest Root Arena", 64 * 1024};
+    FrameGraphAllocator arena{"DependencyGraphTest Arena", {rootArena, 64 * 1024}};
 };
 
 class Node final : public DependencyGraph::Node {
@@ -108,8 +120,8 @@ public:
     bool isCulledCalled() const noexcept { return this->isCulled(); }
 };
 
-TEST(DependencyGraphTest, Simple) {
-    DependencyGraph graph;
+TEST_F(DependencyGraphTest, Simple) {
+    DependencyGraph graph(arena);
     Node* n0 = new Node(graph, "node 0");
     Node* n1 = new Node(graph, "node 1");
     Node* n2 = new Node(graph, "node 2");
@@ -118,7 +130,7 @@ TEST(DependencyGraphTest, Simple) {
     new DependencyGraph::Edge(graph, n1, n2);
     n2->makeTarget();
 
-    graph.cull();
+    graph.cull(arena);
 
     //utils::io::sstream graphviz;
     //graph.export_graphviz(graphviz);
@@ -142,8 +154,8 @@ TEST(DependencyGraphTest, Simple) {
     for (auto const n : nodes) { delete n; }
 }
 
-TEST(DependencyGraphTest, Culling1) {
-    DependencyGraph graph;
+TEST_F(DependencyGraphTest, Culling1) {
+    DependencyGraph graph(arena);
     Node* n0 = new Node(graph, "node 0");
     Node* n1 = new Node(graph, "node 1");
     Node* n2 = new Node(graph, "node 2");
@@ -154,7 +166,7 @@ TEST(DependencyGraphTest, Culling1) {
     new DependencyGraph::Edge(graph, n1, n1_0);
     n2->makeTarget();
 
-    graph.cull();
+    graph.cull(arena);
 
     //utils::io::sstream graphviz;
     //graph.export_graphviz(graphviz);
@@ -181,8 +193,8 @@ TEST(DependencyGraphTest, Culling1) {
     for (auto const n : nodes) { delete n; }
 }
 
-TEST(DependencyGraphTest, Culling2) {
-    DependencyGraph graph;
+TEST_F(DependencyGraphTest, Culling2) {
+    DependencyGraph graph(arena);
     Node* n0 = new Node(graph, "node 0");
     Node* n1 = new Node(graph, "node 1");
     Node* n2 = new Node(graph, "node 2");
@@ -197,7 +209,7 @@ TEST(DependencyGraphTest, Culling2) {
     new DependencyGraph::Edge(graph, n1_0, n1_0_1);
     n2->makeTarget();
 
-    graph.cull();
+    graph.cull(arena);
 
     //utils::io::sstream graphviz;
     //graph.export_graphviz(graphviz);

@@ -17,9 +17,9 @@
 #ifndef TNT_UTILS_BENCHMARK_PEROFRMANCECOUNTERS_H
 #define TNT_UTILS_BENCHMARK_PEROFRMANCECOUNTERS_H
 
-#include <benchmark/benchmark.h>
-
 #include <utils/Profiler.h>
+
+#include <benchmark/benchmark.h>
 
 class PerformanceCounters {
     benchmark::State& state;
@@ -36,12 +36,18 @@ public:
         profiler.stop();
         counters = profiler.readCounters();
         if (profiler.isValid()) {
-            state.counters.insert({
-                    { "C",   { (double)counters.getCpuCycles(),    benchmark::Counter::kAvgIterations }},
-                    { "I",   { (double)counters.getInstructions(), benchmark::Counter::kAvgIterations }},
-                    { "BPU", { (double)counters.getBranchMisses(), benchmark::Counter::kAvgIterations }},
-                    { "CPI", { (double)counters.getCPI(),          benchmark::Counter::kAvgThreads }},
-            });
+            if (counters.getInstructions() > 0) {
+                state.counters.insert({
+                        { "C",   { (double)counters.getCpuCycles(),    benchmark::Counter::kAvgIterations }},
+                        { "I",   { (double)counters.getInstructions(), benchmark::Counter::kAvgIterations }},
+                        { "BPU", { (double)counters.getBranchMisses(), benchmark::Counter::kAvgIterations }},
+                        { "CPI", { (double)counters.getCPI(),          benchmark::Counter::kAvgThreads }},
+                });
+            } else if (counters.getCpuCycles() > 0) {
+                state.counters.insert({
+                        { "C",   { (double)counters.getCpuCycles(),    benchmark::Counter::kAvgIterations }},
+                });
+            }
         }
     }
 };

@@ -30,14 +30,27 @@ public class MaterialBuilder {
     private final long mNativeObject;
 
     private static Class<?> sEngineClass = null;
+    private static Method sGetJobSystemMethod = null;
     private static Method sGetNativeJobSystemMethod = null;
 
     static {
         System.loadLibrary("filamat-jni");
         try {
             sEngineClass = Class.forName("com.google.android.filament.Engine");
-            sGetNativeJobSystemMethod = sEngineClass.getDeclaredMethod("getNativeJobSystem");
-        } catch (ClassNotFoundException | NoSuchMethodException e) {
+            try {
+                Class<?> helperClass = Class.forName("com.google.android.filament.android.FilamentHelper");
+                sGetJobSystemMethod = helperClass.getDeclaredMethod("getJobSystem", sEngineClass);
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
+                // FilamentHelper might not be present; fall back to Engine.getNativeJobSystem
+            }
+            if (sGetJobSystemMethod == null) {
+                try {
+                    sGetNativeJobSystemMethod = sEngineClass.getDeclaredMethod("getNativeJobSystem");
+                } catch (NoSuchMethodException e) {
+                    // Ignore
+                }
+            }
+        } catch (ClassNotFoundException e) {
             // It's okay if we don't find it, this is to avoid creating dependencies
         }
     }
@@ -384,6 +397,17 @@ public class MaterialBuilder {
         return this;
     }
 
+    /**
+     * Enables or disables colored penumbrae for any shadows cast on this material. The material
+     * must be set on a shadow receiver for this parameter to take effect. This property is
+     * always enabled when the shading model is set to `Shading.SUBSURFACE`.
+     */
+    @NonNull
+    public MaterialBuilder coloredPenumbra(boolean coloredPenumbra) {
+        nMaterialBuilderColoredPenumbra(mNativeObject, coloredPenumbra);
+        return this;
+    }
+
     @NonNull
     public MaterialBuilder specularAntiAliasing(boolean specularAntiAliasing) {
         nMaterialBuilderSpecularAntiAliasing(mNativeObject, specularAntiAliasing);
@@ -530,14 +554,17 @@ public class MaterialBuilder {
     @NonNull
     public MaterialPackage build(@Nullable Object jobSystemProvider) {
         long nativeJobSystem = 0;
-        if (jobSystemProvider != null && sEngineClass != null) {
-            if (sEngineClass.isInstance(jobSystemProvider) && sGetNativeJobSystemMethod != null) {
-                try {
+        if (jobSystemProvider != null && sEngineClass != null && sEngineClass.isInstance(jobSystemProvider)) {
+            try {
+                if (sGetJobSystemMethod != null) {
+                    //noinspection ConstantConditions
+                    nativeJobSystem = (Long) sGetJobSystemMethod.invoke(null, jobSystemProvider);
+                } else if (sGetNativeJobSystemMethod != null) {
                     //noinspection ConstantConditions
                     nativeJobSystem = (Long) sGetNativeJobSystemMethod.invoke(jobSystemProvider);
-                } catch (IllegalAccessException | InvocationTargetException e) {
-                    // Ignore
                 }
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                // Ignore
             }
         }
 
@@ -608,6 +635,8 @@ public class MaterialBuilder {
             boolean shadowMultiplier);
     private static native void nMaterialBuilderTransparentShadow(long mNativeObject,
             boolean transparentShadow);
+    private static native void nMaterialBuilderColoredPenumbra(long mNativeObject,
+            boolean coloredPenumbra);
     private static native void nMaterialBuilderSpecularAntiAliasing(long mNativeObject,
             boolean specularAntiAliasing);
     private static native void nMaterialBuilderSpecularAntiAliasingVariance(long mNativeObject,

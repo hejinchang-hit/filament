@@ -15,6 +15,9 @@
  */
 #include "webgpu/WebGPUDriver.h"
 
+#include "CommandStreamDispatcher.h"
+#include "DriverBase.h"
+#include "SystraceProfile.h"
 #include "WebGPUBufferObject.h"
 #include "WebGPUConstants.h"
 #include "WebGPUDescriptorSet.h"
@@ -33,25 +36,28 @@
 #include "WebGPUTextureHelpers.h"
 #include "WebGPUVertexBuffer.h"
 #include "WebGPUVertexBufferInfo.h"
-#include "webgpu/utils/AsyncTaskCounter.h"
-#include <backend/platforms/WebGPUPlatform.h>
 
-#include "CommandStreamDispatcher.h"
-#include "DriverBase.h"
-#include "SystraceProfile.h"
-#include "private/backend/Dispatcher.h"
+#include "webgpu/utils/AsyncTaskCounter.h"
+
+#include <private/backend/BackendUtils.h>
+#include <private/backend/Dispatcher.h>
+
 #include <backend/DriverEnums.h>
 #include <backend/Handle.h>
+#include <backend/platforms/WebGPUPlatform.h>
 #include <backend/TargetBufferInfo.h>
-#include <private/backend/BackendUtils.h>
+
+#include <private/utils/FeatureFlagManager.h>
+
+#include <utils/compiler.h>
+#include <utils/CString.h>
+#include <utils/debug.h>
+#include <utils/Hash.h>
+#include <utils/ImmutableCString.h>
+#include <utils/Logger.h>
+#include <utils/Panic.h>
 
 #include <math/mat3.h>
-#include <utils/debug.h>
-#include <utils/CString.h>
-#include <utils/ImmutableCString.h>
-#include <utils/Hash.h>
-#include <utils/Panic.h>
-#include <utils/compiler.h>
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -63,22 +69,6 @@
 #include <utility>
 
 using namespace std::chrono_literals;
-
-
-// https://issues.chromium.org/issues/507581790
-// Manual polyfill pending upstream fix.
-#if defined(__EMSCRIPTEN__)
-#include <emscripten/em_js.h>
-
-EM_JS(void, wgpuRenderPassEncoderSetImmediates, (WGPURenderPassEncoder passEncoder,
-                uint32_t offset, void const * data, size_t size), {
-    const encoder = WebGPU.Internals.jsObjects[passEncoder];
-    if (encoder && encoder.setImmediates) {
-        const buffer = HEAPU8.slice(data, data + size);
-        encoder.setImmediates(offset, buffer);
-    }
-})
-#endif
 
 namespace filament::backend {
 
@@ -119,19 +109,24 @@ Driver* WebGPUDriver::create(WebGPUPlatform& platform, const Platform::DriverCon
 
 WebGPUDriver::WebGPUDriver(WebGPUPlatform& platform,
         const Platform::DriverConfig& driverConfig) noexcept
-    : DriverBase(driverConfig),
-      mPlatform{ platform },
-      mAdapter{ mPlatform.requestAdapter(nullptr) },
-      mDevice{ mPlatform.requestDevice(mAdapter) },
-      mQueueManager{ mDevice },
-      mStagePool{ mDevice },
-      mPipelineLayoutCache{ mDevice },
-      mPipelineCache{ mDevice },
-      mRenderPassMipmapGenerator{ mDevice, &mQueueManager },
-      mSpdComputePassMipmapGenerator{ mDevice },
-      mBlitter{ mDevice },
-      mHandleAllocator{ "Handles", driverConfig.handleArenaSize,
-          driverConfig.disableHandleUseAfterFreeCheck, driverConfig.disableHeapHandleTags }{
+        : DriverBase(driverConfig),
+          mPlatform{ platform },
+          mAdapter{ mPlatform.requestAdapter(nullptr) },
+          mDevice{ mPlatform.requestDevice(mAdapter) },
+          mQueueManager{ mDevice },
+          mStagePool{ mDevice },
+          mPipelineLayoutCache{ mDevice },
+          mPipelineCache{ mDevice },
+          mRenderPassMipmapGenerator{ mDevice, &mQueueManager },
+          mSpdComputePassMipmapGenerator{ mDevice },
+          mBlitter{ mDevice },
+          mHandleAllocator{ "Handles", driverConfig.handleArenaSize,
+              (driverConfig.featureFlagManager ? driverConfig.featureFlagManager->features.backend
+                                                         .disable_handle_use_after_free_check
+                                               : false),
+              (driverConfig.featureFlagManager ? driverConfig.featureFlagManager->features.backend
+                                                         .disable_heap_handle_tags
+                                               : false) } {
     mDevice.GetLimits(&mDeviceLimits);
 }
 
@@ -211,6 +206,7 @@ void WebGPUDriver::flush(int) {
 
 void WebGPUDriver::finish(int /* dummy */) {
     mQueueManager.finish();
+    mPipelineState = {};
 
     // We use polling to advance webgpu's callback counter until all the read backs have been
     // processed. Note that blocking with mReadPixelMapsCounter.waitForAllToFinish will only
@@ -295,6 +291,20 @@ void WebGPUDriver::destroySwapChain(Handle<HwSwapChain> sch) {
         destructHandle<WebGPUSwapChain>(sch);
     }
     mSwapChain = nullptr;
+}
+
+void WebGPUDriver::setFrameRate(Handle<HwSwapChain> sch, float const frameRate,
+        Platform::FrameRateCompatibility const compatibility,
+        Platform::ChangeFrameRateStrategy const strategy) {
+    if (sch) {
+        auto swapChain = handleCast<WebGPUSwapChain>(sch);
+        if (swapChain) {
+            int const err = mPlatform.setFrameRate(swapChain, frameRate, compatibility, strategy);
+            if (err < 0) {
+                LOG(WARNING) << "Platform::setFrameRate returned an error: " << err;
+            }
+        }
+    }
 }
 
 void WebGPUDriver::destroyStream(Handle<HwStream> sh) {
@@ -426,6 +436,10 @@ Handle<HwVertexBuffer> WebGPUDriver::createVertexBufferS() noexcept {
     return allocHandle<WebGPUVertexBuffer>();
 }
 
+Handle<HwVertexBuffer> WebGPUDriver::createVertexBufferAsyncS() noexcept {
+    return allocHandle<WebGPUVertexBuffer>();
+}
+
 Handle<HwDescriptorSet> WebGPUDriver::createDescriptorSetS() noexcept {
     return allocHandle<WebGPUDescriptorSet>();
 }
@@ -489,7 +503,7 @@ void WebGPUDriver::createSwapChainR(Handle<HwSwapChain> sch, void* nativeWindow,
 
     wgpu::Extent2D extent = mPlatform.getSurfaceExtent(mNativeWindow);
     mSwapChain = constructHandle<WebGPUSwapChain>(sch, std::move(surface), extent, mAdapter,
-            mDevice, flags);
+            mDevice, nativeWindow, flags);
     assert_invariant(mSwapChain);
 
 #if !FWGPU_ENABLED(FWGPU_PRINT_SYSTEM) && !defined(NDEBUG)
@@ -539,6 +553,13 @@ void WebGPUDriver::createVertexBufferR(Handle<HwVertexBuffer> vertexBufferHandle
     setDebugTag(vertexBufferHandle.getId(), std::move(tag));
 }
 
+void WebGPUDriver::createVertexBufferAsyncR(Handle<HwVertexBuffer> vertexBufferHandle,
+        const uint32_t vertexCount, Handle<HwVertexBufferInfo> vertexBufferInfoHandle,
+        CallbackHandler* handler, AsyncCallback callback, void* user,
+        utils::ImmutableCString&& tag) {
+    // TODO: implement this.
+}
+
 void WebGPUDriver::createIndexBufferR(Handle<HwIndexBuffer> indexBufferHandle,
         const ElementType elementType, const uint32_t indexCount, const BufferUsage usage,
         utils::ImmutableCString&& tag) {
@@ -550,7 +571,7 @@ void WebGPUDriver::createIndexBufferR(Handle<HwIndexBuffer> indexBufferHandle,
 
 void WebGPUDriver::createIndexBufferAsyncR(Handle<HwIndexBuffer> indexBufferHandle,
         const ElementType elementType, const uint32_t indexCount, const BufferUsage usage,
-        CallbackHandler* handler, CallbackHandler::Callback callback, void* user,
+        CallbackHandler* handler, AsyncCallback callback, void* user,
         utils::ImmutableCString&& tag) {
     // TODO: implement this.
 }
@@ -565,7 +586,7 @@ void WebGPUDriver::createBufferObjectR(Handle<HwBufferObject> bufferObjectHandle
 
 void WebGPUDriver::createBufferObjectAsyncR(Handle<HwBufferObject> bufferObjectHandle,
         const uint32_t byteCount, const BufferObjectBinding bindingType, const BufferUsage usage,
-        CallbackHandler* handler, CallbackHandler::Callback callback, void* user,
+        CallbackHandler* handler, AsyncCallback callback, void* user,
         utils::ImmutableCString&& tag) {
     // TODO: implement this.
 }
@@ -583,7 +604,7 @@ void WebGPUDriver::createTextureR(Handle<HwTexture> textureHandle, const Sampler
 void WebGPUDriver::createTextureAsyncR(Handle<HwTexture> textureHandle, const SamplerType target,
         const uint8_t levels, const TextureFormat format, const uint8_t samples,
         const uint32_t width, const uint32_t height, const uint32_t depth,
-        const TextureUsage usage, CallbackHandler* handler, CallbackHandler::Callback callback,
+        const TextureUsage usage, CallbackHandler* handler, AsyncCallback callback,
         void* user, utils::ImmutableCString&& tag) {
     // TODO: implement this.
     FWGPU_SYSTRACE_SCOPE();
@@ -630,7 +651,7 @@ void WebGPUDriver::createTextureViewSwizzleAsyncR(Handle<HwTexture> textureHandl
         Handle<HwTexture> sourceTextureHandle, const backend::TextureSwizzle r,
         const backend::TextureSwizzle g, const backend::TextureSwizzle b,
         const backend::TextureSwizzle a, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user, utils::ImmutableCString&& tag) {
+        AsyncCallback const callback, void* user, utils::ImmutableCString&& tag) {
     // TODO: implement this.
 }
 
@@ -666,7 +687,7 @@ void WebGPUDriver::importTextureR(Handle<HwTexture> textureHandle, const intptr_
 void WebGPUDriver::importTextureAsyncR(Handle<HwTexture> textureHandle, const intptr_t id,
         const SamplerType target, const uint8_t levels, const TextureFormat format,
         const uint8_t samples, const uint32_t width, const uint32_t height, const uint32_t depth,
-        const TextureUsage usage, CallbackHandler* handler, CallbackHandler::Callback callback,
+        const TextureUsage usage, CallbackHandler* handler, AsyncCallback callback,
         void* user, utils::ImmutableCString&& tag) {
     PANIC_POSTCONDITION("Import WebGPU Texture is not supported");
     // TODO: implement this.
@@ -679,7 +700,9 @@ void WebGPUDriver::createRenderPrimitiveR(Handle<HwRenderPrimitive> renderPrimit
     assert_invariant(mDevice);
     const auto renderPrimitive = constructHandle<WebGPURenderPrimitive>(renderPrimitiveHandle);
     const auto vertexBuffer = handleCast<WebGPUVertexBuffer>(vertexBufferHandle);
-    const auto indexBuffer = handleCast<WebGPUIndexBuffer>(indexBufferHandle);
+    // Non-indexed (attribute-less) primitives have no IndexBuffer.
+    const auto indexBuffer =
+            indexBufferHandle ? handleCast<WebGPUIndexBuffer>(indexBufferHandle) : nullptr;
     renderPrimitive->vertexBuffer = vertexBuffer;
     renderPrimitive->indexBuffer = indexBuffer;
     renderPrimitive->type = primitiveType;
@@ -790,7 +813,24 @@ void WebGPUDriver::destroyFence(Handle<HwFence> fenceHandle) {
 }
 
 void WebGPUDriver::fenceCancel(FenceHandle fh) {
-    // it's okay to implement cancel as a no-op, because not all API support truly canceling.
+    // Even though this is a synchronous call, the fence handle must be (and stay) valid
+    assert_invariant(fh);
+    const auto fence = handleCast<WebGPUFence>(fh);
+    assert_invariant(fence);
+
+    // This cannot be a no-op the way it is for backends that can simply abandon a waiter.
+    //
+    // A WebGPU fence is only ever satisfied from the OnSubmittedWorkDone callback, and Dawn only
+    // delivers that callback while something pumps Instance::ProcessEvents() -- for us that is
+    // exclusively WebGPUQueueManager::finish(), which runs on the driver thread.
+    //
+    // Signaling ERROR here matches OpenGLDriver::fenceCancel and is handled by callers as "fence
+    // wait unsupported / unavailable", which is the correct interpretation of a cancelled fence.
+    if (auto const state = fence->getState()) {
+        state->setStatus(FenceStatus::ERROR);
+    }
+    // If no submission state has been attached yet there is nothing to signal: the state is
+    // attached by createFenceR on the driver thread, which is ordered before any cancel.
 }
 
 FenceStatus WebGPUDriver::getFenceStatus(Handle<HwFence> fenceHandle) {
@@ -924,6 +964,7 @@ bool WebGPUDriver::isProtectedContentSupported() {
     return false;
 }
 
+
 bool WebGPUDriver::isStereoSupported() {
     return false;
 }
@@ -985,7 +1026,10 @@ uint8_t WebGPUDriver::getMaxDrawBuffers() {
 }
 
 size_t WebGPUDriver::getMaxUniformBufferSize() {
-    return mDeviceLimits.maxUniformBufferBindingSize;
+    // TODO: We hardcode to WebGPU minspec (64 KiB) until we support specialization constants for
+    // UBO binding sizes.
+    return 65536;
+    // return mDeviceLimits.maxUniformBufferBindingSize;
 }
 
 size_t WebGPUDriver::getMaxTextureSize(const SamplerType target) {
@@ -1023,7 +1067,7 @@ void WebGPUDriver::updateIndexBuffer(Handle<HwIndexBuffer> indexBufferHandle,
 void WebGPUDriver::updateIndexBufferAsyncR(AsyncCallId jobId,
         Handle<HwIndexBuffer> indexBufferHandle, BufferDescriptor&& bufferDescriptor,
         const uint32_t byteOffset, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
+        AsyncCallback const callback, void* user) {
     // TODO: implement this.
 }
 
@@ -1036,7 +1080,7 @@ void WebGPUDriver::updateBufferObject(Handle<HwBufferObject> bufferObjectHandle,
 
 void WebGPUDriver::updateBufferObjectAsyncR(AsyncCallId jobId, Handle<HwBufferObject> bufferObjectHandle,
         BufferDescriptor&& bufferDescriptor, const uint32_t byteOffset, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
+        AsyncCallback const callback, void* user) {
     // TODO: implement this.
 }
 
@@ -1063,7 +1107,7 @@ void WebGPUDriver::setVertexBufferObject(Handle<HwVertexBuffer> vertexBufferHand
 void WebGPUDriver::setVertexBufferObjectAsyncR(AsyncCallId jobId,
         Handle<HwVertexBuffer> vertexBufferHandle, const uint32_t index,
         Handle<HwBufferObject> bufferObjectHandle, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
+        AsyncCallback const callback, void* user) {
     // TODO: implement this.
 }
 
@@ -1145,10 +1189,12 @@ void WebGPUDriver::update3DImage(Handle<HwTexture> textureHandle, const uint32_t
     const auto extent{
         wgpu::Extent3D{ .width = width, .height = height, .depthOrArrayLayers = depth }
     };
-    const uint32_t bytesPerRow{ static_cast<uint32_t>(
-            PixelBufferDescriptor::computePixelSize(inputData->format, inputData->type) * width) };
-    const uint8_t* dataBuff{ static_cast<const uint8_t*>(inputData->buffer) };
-    const size_t dataSize{ inputData->size };
+    const size_t bpp = PixelBufferDescriptor::computePixelSize(inputData->format, inputData->type);
+    const uint32_t stride = inputData->stride ? inputData->stride : width;
+    const uint32_t bytesPerRow = static_cast<uint32_t>(bpp * stride);
+    const size_t offsetBytes = (inputData->top * bytesPerRow) + (inputData->left * bpp);
+    const uint8_t* dataBuff = static_cast<const uint8_t*>(inputData->buffer) + offsetBytes;
+    const size_t dataSize = inputData->size - offsetBytes;
     const auto layout{ wgpu::TexelCopyBufferLayout{
         .bytesPerRow = bytesPerRow,
         .rowsPerImage = height,
@@ -1214,7 +1260,7 @@ void WebGPUDriver::update3DImageAsyncR(AsyncCallId jobId,
         const uint32_t xoffset, const uint32_t yoffset, const uint32_t zoffset,
         const uint32_t width, const uint32_t height, const uint32_t depth,
         PixelBufferDescriptor&& pixelBufferDescriptor, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
+        AsyncCallback const callback, void* user) {
     // TODO: implement this.
 }
 
@@ -1307,9 +1353,6 @@ void WebGPUDriver::beginRenderPass(Handle<HwRenderTarget> renderTargetHandle,
     wgpu::TextureView defaultDepthStencilView = nullptr;
     wgpu::TextureFormat defaultDepthStencilFormat = wgpu::TextureFormat::Undefined;
 
-    const bool msaaSidecarsRequired{ renderTarget->getSamples() > 1 &&
-                                     renderTarget->getSampleCountPerAttachment() <= 1 };
-
     std::array<wgpu::TextureView, MRT::MAX_SUPPORTED_RENDER_TARGET_COUNT> customColorViews{};
     std::array<wgpu::TextureView, customColorViews.size()> customColorMsaaSidecarViews{};
     uint32_t customColorViewCount = 0;
@@ -1320,8 +1363,18 @@ void WebGPUDriver::beginRenderPass(Handle<HwRenderTarget> renderTargetHandle,
 
     mCurrentRenderTarget = renderTarget;
     if (renderTarget->isDefaultRenderTarget()) {
-        assert_invariant(mSwapChain && mTextureView);
-        defaultColorView = mTextureView;
+        assert_invariant(mSwapChain);
+
+        if (!mSwapChainView) {
+            mSwapChainView = mSwapChain->isHeadless() ?
+                mSwapChain->getNextTextureView() :
+                mSwapChain->getNextTextureView(mPlatform.getSurfaceExtent(mNativeWindow));
+
+            // We need to set the extent for the render target for use in scissor()
+            renderTarget->width = mSwapChain->getWidth();
+            renderTarget->height = mSwapChain->getHeight();
+        }
+        defaultColorView  = mSwapChainView;
         defaultDepthStencilView = mSwapChain->getDepthTextureView();
         defaultDepthStencilFormat = mSwapChain->getDepthFormat();
 
@@ -1350,6 +1403,9 @@ void WebGPUDriver::beginRenderPass(Handle<HwRenderTarget> renderTargetHandle,
                     customColorViews[customColorViewCount] =
                             colorTexture->makeAttachmentTextureView(mipLevel, arrayLayer,
                                     renderTarget->getLayerCount());
+
+                    const bool msaaSidecarsRequired{ renderTarget->getSamples() > 1 &&
+                                 colorTexture->samples == 1 };
                     if (msaaSidecarsRequired) {
                         const wgpu::TextureView msaaSidecarView{
                             colorTexture->makeMsaaSidecarTextureViewIfTextureSidecarExists(
@@ -1394,7 +1450,7 @@ void WebGPUDriver::beginRenderPass(Handle<HwRenderTarget> renderTargetHandle,
             if (dsTexture) {
                 customDepthStencilView = dsTexture->makeAttachmentTextureView(depthStencilMipLevel,
                         depthStencilArrayLayer, renderTarget->getLayerCount());
-                if (msaaSidecarsRequired) {
+                if (renderTarget->getSamples() > 1 && dsTexture->samples == 1) {
                     customDepthStencilMsaaSidecarTextureView =
                             dsTexture->makeMsaaSidecarTextureViewIfTextureSidecarExists(
                                     renderTarget->getSamples(), depthStencilMipLevel,
@@ -1403,6 +1459,7 @@ void WebGPUDriver::beginRenderPass(Handle<HwRenderTarget> renderTargetHandle,
                             << "Could not get a required MSAA sidecar texture view for "
                                "depth/stencil?";
                 }
+
                 customDepthStencilFormat = dsTexture->getViewFormat();
 
                 if (any(renderTarget->getTargetFlags() & TargetBufferFlags::STENCIL) &&
@@ -1451,6 +1508,7 @@ void WebGPUDriver::endRenderPass(int /* dummy */) {
     FWGPU_SYSTRACE_SCOPE();
     mRenderPassEncoder.End();
     mRenderPassEncoder = nullptr;
+    mPipelineState = {};
 }
 
 void WebGPUDriver::nextSubpass(int) {
@@ -1479,18 +1537,11 @@ void WebGPUDriver::makeCurrent(Handle<HwSwapChain> drawSwapChain,
     auto swapChain = handleCast<WebGPUSwapChain>(drawSwapChain);
     mSwapChain = swapChain;
     assert_invariant(mSwapChain);
-
-    if (mSwapChain->isHeadless()) {
-        mTextureView = mSwapChain->getNextTextureView();
-    } else {
-        mTextureView = mSwapChain->getNextTextureView(mPlatform.getSurfaceExtent(mNativeWindow));
-    }
-    assert_invariant(mTextureView);
 }
 
 void WebGPUDriver::commit(Handle<HwSwapChain> sch) {
     mQueueManager.flush();
-    mTextureView = nullptr;
+    mSwapChainView = nullptr;
     assert_invariant(mSwapChain);
     mSwapChain->present(*this);
 }
@@ -1498,22 +1549,9 @@ void WebGPUDriver::commit(Handle<HwSwapChain> sch) {
 void WebGPUDriver::setPushConstant(backend::ShaderStage stage, uint8_t index,
         backend::PushConstantVariant value) {
     assert_invariant(mRenderPassEncoder && "Should be called within a renderpass");
-    uint32_t data = 0;
-    if (std::holds_alternative<int32_t>(value)) {
-        int32_t v = std::get<int32_t>(value);
-        std::memcpy(&data, &v, sizeof(data));
-    } else if (std::holds_alternative<float>(value)) {
-        float v = std::get<float>(value);
-        std::memcpy(&data, &v, sizeof(data));
-    } else if (std::holds_alternative<bool>(value)) {
-        data = std::get<bool>(value) ? 1 : 0;
-    }
-#if defined(__EMSCRIPTEN__)
-    wgpuRenderPassEncoderSetImmediates(mRenderPassEncoder.Get(), index * sizeof(uint32_t), &data,
-            sizeof(uint32_t));
-#else
-    mRenderPassEncoder.SetImmediates(index * sizeof(uint32_t), &data, sizeof(uint32_t));
-#endif
+    assert_invariant(mPipelineState.program && "Expect a program when writing to push constants");
+    mPipelineState.program->pushConstantDescription.setPushConstant(mRenderPassEncoder, stage,
+            index, value);
 }
 
 void WebGPUDriver::insertEventMarker(char const* string) {
@@ -1727,6 +1765,7 @@ void WebGPUDriver::readTextureToBuffer(wgpu::Texture srcTexture, uint32_t level,
         wgpu::Buffer buffer;
         size_t unpaddedBytesPerRow;
         size_t paddedBytesPerRow;
+        uint32_t width;
         uint32_t height;
         WebGPUDriver *driver;
     };
@@ -1735,6 +1774,7 @@ void WebGPUDriver::readTextureToBuffer(wgpu::Texture srcTexture, uint32_t level,
             .buffer = std::move(stagingBuffer),
             .unpaddedBytesPerRow = unpaddedBytesPerRow,
             .paddedBytesPerRow = paddedBytesPerRow,
+            .width = width,
             .height = actualHeight,
             .driver = this,
     });
@@ -1744,26 +1784,33 @@ void WebGPUDriver::readTextureToBuffer(wgpu::Texture srcTexture, uint32_t level,
     // pending to be submitted.
     mQueueManager.flush();
     userData->buffer.MapAsync(
-            wgpu::MapMode::Read, 0, bufferSize, wgpu::CallbackMode::AllowSpontaneous,
-            [](wgpu::MapAsyncStatus status, const char* message, UserData* userdata) {
+            wgpu::MapMode::Read, 0, bufferSize, wgpu::CallbackMode::AllowProcessEvents,
+            [](wgpu::MapAsyncStatus status, wgpu::StringView message, UserData* userdata) {
                 std::unique_ptr<UserData> data(static_cast<UserData*>(userdata));
                 if (UTILS_LIKELY(status == wgpu::MapAsyncStatus::Success)) {
-                    const char *src {static_cast<const char *>(
-                            data->buffer.GetConstMappedRange(0, data->buffer.GetSize()))};
+                    const char* src{ static_cast<const char*>(
+                            data->buffer.GetConstMappedRange(0, data->buffer.GetSize())) };
                     char* dst{ static_cast<char*>(data->pixelBufferDescriptor.buffer) };
+                    PixelBufferDescriptor& p = data->pixelBufferDescriptor;
+                    size_t const stride = p.stride ? p.stride : data->width;
+                    size_t const bpp =
+                            PixelBufferDescriptor::computeDataSize(p.format, p.type, 1, 1, 1);
+                    size_t const dstBpr = PixelBufferDescriptor::computeDataSize(p.format, p.type,
+                            stride, 1, p.alignment);
+                    char* const pDstStart = dst + p.left * bpp + p.top * dstBpr;
 
                     // If padding was added for alignment, we need to copy row by row.
-                    if (data->paddedBytesPerRow == data->unpaddedBytesPerRow) {
-                        memcpy(dst, src, data->unpaddedBytesPerRow * data->height);
+                    if (dstBpr == data->paddedBytesPerRow) {
+                        memcpy(pDstStart, src, dstBpr * data->height);
                     } else {
                         for (uint32_t i{ 0 }; i < data->height; ++i) {
-                            memcpy(dst + i * data->unpaddedBytesPerRow,
-                                    src + i * data->paddedBytesPerRow, data->unpaddedBytesPerRow);
+                            memcpy(pDstStart + i * dstBpr, src + i * data->paddedBytesPerRow,
+                                    data->unpaddedBytesPerRow);
                         }
                     }
                     data->buffer.Unmap();
                 } else {
-                    FWGPU_LOGE << "Failed to map staging buffer: " << message;
+                    FWGPU_LOGE << "Failed to map staging buffer: " << std::string_view(message);
                 }
                 data->driver->scheduleDestroy(std::move(data->pixelBufferDescriptor));
                 data->driver->mReadPixelMapsCounter.finishTask();
@@ -1800,31 +1847,59 @@ void WebGPUDriver::blitDEPRECATED(TargetBufferFlags buffers,
                                 destinationViewport.left >= 0 && destinationViewport.bottom >= 0)
             << "Source and destination viewports must be positive.";
 
-    // We always blit from/to the COLOR0 attachment.
-    auto sourceAttachment {sourceTarget->getColorAttachmentInfos()[0]};
-    Handle<HwTexture> sourceTextureHandle{ sourceAttachment.handle };
-    auto destinationAttachment {destinationTarget->getColorAttachmentInfos()[0]};
-    Handle<HwTexture> destinationTextureHandle{
-        destinationAttachment.handle
+    wgpu::Texture srcTexture{ nullptr };
+    wgpu::Texture dstTexture{ nullptr };
+    uint32_t srcLevel = 0;
+    uint32_t srcLayer = 0;
+    uint32_t dstLevel = 0;
+    uint32_t dstLayer = 0;
+    wgpu::TextureAspect srcAspect = wgpu::TextureAspect::All;
+    wgpu::TextureAspect dstAspect = wgpu::TextureAspect::All;
+
+    auto extractTextureInfo = [&](const WebGPURenderTarget* target, wgpu::Texture& outTexture,
+                                      wgpu::TextureAspect& outAspect, uint32_t& outLevel,
+                                      uint32_t& outLayer) {
+        if (target->isDefaultRenderTarget()) {
+            assert_invariant(mSwapChain);
+            if (UTILS_UNLIKELY(!mSwapChainView)) {
+                // TODO: clean-up. It is not ideal.
+                mSwapChainView = mSwapChain->isHeadless()
+                                         ? mSwapChain->getNextTextureView()
+                                         : mSwapChain->getNextTextureView(
+                                                   mPlatform.getSurfaceExtent(mNativeWindow));
+            }
+            outTexture = mSwapChain->getCurrentTexture();
+            outAspect = wgpu::TextureAspect::All;
+            outLevel = 0;
+            outLayer = 0;
+        } else {
+            auto const& info = target->getColorAttachmentInfos()[0];
+            auto const& handle = info.handle;
+            if (UTILS_LIKELY(handle)) {
+                auto const tex{ handleCast<WebGPUTexture>(handle) };
+                outTexture = tex->getTexture();
+                outAspect = tex->getAspect();
+                outLevel = info.level;
+                outLayer = info.layer;
+            }
+        }
     };
 
-    if (UTILS_UNLIKELY(!sourceTextureHandle || !destinationTextureHandle)) {
+    extractTextureInfo(sourceTarget, srcTexture, srcAspect, srcLevel, srcLayer);
+    extractTextureInfo(destinationTarget, dstTexture, dstAspect, dstLevel, dstLayer);
+
+    if (UTILS_UNLIKELY(!srcTexture || !dstTexture)) {
         FWGPU_LOGE << "blitDEPRECATED could not find a valid color attachment to blit.";
         return;
     }
 
     // WebGPU's texture coordinates are top-left, while Filament's are bottom-left.
     // We need to flip the y-coordinate for both source and destination.
-    auto const sourceTexture{ handleCast<WebGPUTexture>(sourceTextureHandle) };
-    auto const destinationTexture{ handleCast<WebGPUTexture>(destinationTextureHandle) };
+    const uint32_t srcLevelHeight = std::max(1u, srcTexture.GetHeight() >> srcLevel);
+    const uint32_t flippedSourceY{ srcLevelHeight - sourceViewport.bottom - sourceViewport.height };
 
-    const uint32_t sourceTextureHeight{ sourceTexture->height };
-    const uint32_t flippedSourceY{ sourceTextureHeight - sourceViewport.bottom -
-                                   sourceViewport.height };
-
-    const uint32_t destinationTextureHeight{ destinationTexture->height };
-    const uint32_t flippedDestinationY{ destinationTextureHeight - destinationViewport.bottom -
-                                        destinationViewport.height };
+    const uint32_t dstLevelHeight = std::max(1u, dstTexture.GetHeight() >> dstLevel);
+    const uint32_t flippedDestinationY{ dstLevelHeight - destinationViewport.bottom - destinationViewport.height };
 
     const wgpu::Origin2D sourceOrigin{ static_cast<uint32_t>(sourceViewport.left), flippedSourceY };
     const wgpu::Origin2D destinationOrigin{ static_cast<uint32_t>(destinationViewport.left),
@@ -1837,19 +1912,19 @@ void WebGPUDriver::blitDEPRECATED(TargetBufferFlags buffers,
 
     wgpu::CommandEncoder commandEncoder = mQueueManager.getCommandEncoder();
     const WebGPUBlitter::BlitArgs blitArgs{
-        .source = { .texture = sourceTexture->getTexture(),
-                    .aspect = sourceTexture->getAspect(),
+        .source = { .texture = srcTexture,
+                    .aspect = srcAspect,
                     .origin = sourceOrigin,
                     .extent = sourceSize,
-                    .mipLevel = sourceAttachment.level,
-                    .layerOrDepth = sourceAttachment.layer,
+                    .mipLevel = srcLevel,
+                    .layerOrDepth = srcLayer,
         },
-        .destination = { .texture = destinationTexture->getTexture(),
-                         .aspect = destinationTexture->getAspect(),
+        .destination = { .texture = dstTexture,
+                         .aspect = dstAspect,
                          .origin = destinationOrigin,
                          .extent = destinationSize,
-                         .mipLevel = destinationAttachment.level,
-                         .layerOrDepth = destinationAttachment.layer,
+                         .mipLevel = dstLevel,
+                         .layerOrDepth = dstLayer,
         },
         .filter = filter,
     };
@@ -1923,6 +1998,7 @@ void WebGPUDriver::bindPipeline(PipelineState const& pipelineState) {
     assert_invariant(mRenderPassEncoder);
     const auto program{ handleCast<WebGPUProgram>(pipelineState.program) };
     assert_invariant(program);
+    mPipelineState.program = program;
     WebGPURenderTarget const* renderTarget{ mCurrentRenderTarget };
     assert_invariant(renderTarget);
     assert_invariant(program->computeShaderModule == nullptr &&
@@ -2020,8 +2096,11 @@ void WebGPUDriver::bindRenderPrimitive(Handle<HwRenderPrimitive> renderPrimitive
                 renderPrimitive->vertexBuffer->getBuffers()[bindingInfo.sourceBufferIndex],
                 bindingInfo.bufferOffset);
     }
-    mRenderPassEncoder.SetIndexBuffer(renderPrimitive->indexBuffer->getBuffer(),
-            renderPrimitive->indexBuffer->getIndexFormat());
+    // Index buffer is optional: non-indexed (attribute-less) primitives have none.
+    if (renderPrimitive->indexBuffer) {
+        mRenderPassEncoder.SetIndexBuffer(renderPrimitive->indexBuffer->getBuffer(),
+                renderPrimitive->indexBuffer->getIndexFormat());
+    }
 }
 
 void WebGPUDriver::draw2(const uint32_t indexOffset, const uint32_t indexCount,
@@ -2037,6 +2116,21 @@ void WebGPUDriver::draw2(const uint32_t indexOffset, const uint32_t indexCount,
     }
 
     mRenderPassEncoder.DrawIndexed(indexCount, instanceCount, indexOffset, 0, 0);
+}
+
+void WebGPUDriver::drawArrays(const uint32_t vertexOffset, const uint32_t vertexCount,
+        const uint32_t instanceCount) {
+    FWGPU_SYSTRACE_SCOPE();
+    // Bind groups are deferred until the actual draw call (mirrors draw2).
+    for (size_t i = 0; i < MAX_DESCRIPTOR_SET_COUNT; i++) {
+        auto& binding = mCurrentDescriptorSets[i];
+        if (binding.bindGroup) {
+            mRenderPassEncoder.SetBindGroup(i, binding.bindGroup, binding.offsetCount,
+                    binding.offsets.data());
+        }
+    }
+
+    mRenderPassEncoder.Draw(vertexCount, instanceCount, vertexOffset, 0);
 }
 
 void WebGPUDriver::draw(PipelineState pipelineState,
@@ -2059,13 +2153,20 @@ void WebGPUDriver::scissor(Viewport scissor) {
     assert_invariant(mRenderPassEncoder);
     assert_invariant(mCurrentRenderTarget);
 
-    uint32_t rtHeight = mCurrentRenderTarget->height;
-    uint32_t rtWidth = mCurrentRenderTarget->width;
-    uint32_t left = std::max(0, scissor.left);
-    uint32_t bottom = std::max(0, scissor.bottom);
-    uint32_t top = rtHeight > (bottom + scissor.height) ? rtHeight - bottom - scissor.height : 0;
-    uint32_t width = std::min((uint32_t)scissor.width, rtWidth - left);
-    uint32_t height = std::min((uint32_t)scissor.height, rtHeight - top);
+    uint32_t const rtWidth = mCurrentRenderTarget->width;
+    uint32_t const rtHeight = mCurrentRenderTarget->height;
+
+    uint32_t const left = std::clamp(scissor.left, 0, int32_t(rtWidth));
+    uint32_t const right = std::clamp(scissor.left + int32_t(scissor.width), 0, int32_t(rtWidth));
+
+    // Filament gives us bottom-left-origin coordinates, we need to convert it to WebGPU's top-left
+    // coordinates.
+    uint32_t const bottom = rtHeight - std::clamp(scissor.bottom, 0, int32_t(rtHeight));
+    uint32_t const top =
+            rtHeight - std::clamp(scissor.bottom + int32_t(scissor.height), 0, int32_t(rtHeight));
+
+    uint32_t const width = right - left;
+    uint32_t const height = bottom - top;
 
     mRenderPassEncoder.SetScissorRect(left, top, width, height);
 }
@@ -2307,7 +2408,7 @@ void WebGPUDriver::copyToMemoryMappedBuffer(MemoryMappedBufferHandle mmbh, size_
 }
 
 void WebGPUDriver::queueCommandAsyncR(AsyncCallId jobId, utils::Invocable<void()>&& command,
-        CallbackHandler* handler, CallbackHandler::Callback const callback, void* user) {
+        CallbackHandler* handler, AsyncCallback const callback, void* user) {
     // TODO: implement this.
 }
 

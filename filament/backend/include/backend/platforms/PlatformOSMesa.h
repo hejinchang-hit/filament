@@ -43,7 +43,7 @@ namespace filament::backend {
  * context that can be used in conjunction with Mesa for software rasterization.
  * See https://docs.mesa3d.org/osmesa.html for more information.
  */
-class PlatformOSMesa : public OpenGLPlatform {
+class UTILS_SHARED_LINKING PlatformOSMesa : public OpenGLPlatform {
 protected:
     // --------------------------------------------------------------------------------------------
     // Platform Interface
@@ -68,8 +68,18 @@ protected:
     void releaseContext() noexcept override;
 
 private:
+    // Rebinds the context to mDummyBuffer so that OSMesa never retains a pointer to a pixel
+    // buffer we are about to free.
+    void bindDummyBuffer() noexcept;
+
     OSMesaContext mContext;
     void* mOsMesaApi = nullptr;
+
+    // OSMesa keeps a raw pointer to the buffer passed to OSMesaMakeCurrent, so the buffer must
+    // outlive the binding. This 1x1 buffer is owned by the platform and is used as a parking
+    // spot whenever the real swapchain goes away.
+    std::unique_ptr<uint8_t[]> mDummyBuffer;
+    void* mCurrentSwapChain = nullptr;
 
     struct ContextInfo {
         OSMesaContext context;

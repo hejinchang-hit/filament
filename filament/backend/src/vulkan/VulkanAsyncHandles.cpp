@@ -17,17 +17,20 @@
 #include "VulkanAsyncHandles.h"
 
 #include "VulkanConstants.h"
+#include "VulkanFencePool.h"
 
 #include "vulkan/utils/Spirv.h"
 
 #include <backend/DriverEnums.h>
 
 #include <utils/debug.h>
+#include <utils/ostream.h>
+#include <utils/sstream.h>
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <shared_mutex>
-#include <chrono>
 
 using namespace bluevk;
 
@@ -104,10 +107,15 @@ void PushConstantDescription::write(VkCommandBuffer cmdbuf, VkPipelineLayout lay
             &binaryValue);
 }
 
-VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
-    : HwProgram(builder.getName()),
-      mInfo(new(std::nothrow) PipelineInfo(builder)),
-      mDevice(device) {
+VulkanProgram::VulkanProgram(VulkanContext const& context, VkDevice device,
+        Program const& builder) noexcept
+        : HwProgram(builder.getName()),
+          mInfo(new(std::nothrow) PipelineInfo(builder)),
+          mDevice(device) {
+
+    utils::io::sstream ss;
+    ss << builder;
+    programString = utils::CString(ss.c_str());
 
     Program::ShaderSource const& blobs = builder.getShadersSource();
     auto& modules = mInfo->shaders;
@@ -141,22 +149,22 @@ VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
                 << "Unable to create shader module."
                 << " error=" << static_cast<int32_t>(result);
 
-#if FVK_ENABLED(FVK_DEBUG_DEBUG_UTILS)
-        utils::CString name{ builder.getName().c_str(), builder.getName().size() };
-        switch (static_cast<ShaderStage>(i)) {
-            case ShaderStage::VERTEX:
-                name += "_vs";
-                break;
-            case ShaderStage::FRAGMENT:
-                name += "_fs";
-                break;
-            default:
-                PANIC_POSTCONDITION("Unexpected stage");
-                break;
+        if (context.isDebugUtilsNamesEnabled()) {
+            utils::CString name{ builder.getName().c_str(), builder.getName().size() };
+            switch (static_cast<ShaderStage>(i)) {
+                case ShaderStage::VERTEX:
+                    name += "_vs";
+                    break;
+                case ShaderStage::FRAGMENT:
+                    name += "_fs";
+                    break;
+                default:
+                    PANIC_POSTCONDITION("Unexpected stage");
+                    break;
+            }
+            context.getDebugUtils().setName(VK_OBJECT_TYPE_SHADER_MODULE,
+                    reinterpret_cast<uint64_t>(module), name.c_str());
         }
-        VulkanDriver::DebugUtils::setName(VK_OBJECT_TYPE_SHADER_MODULE,
-                reinterpret_cast<uint64_t>(module), name.c_str());
-#endif
     }
 
 #if FVK_ENABLED(FVK_DEBUG_SHADER_MODULE)
@@ -181,71 +189,83 @@ void VulkanProgram::flushPushConstants(VkPipelineLayout layout) {
     mQueuedPushConstants.clear();
 }
 
+VulkanCmdFence::VulkanCmdFence(VkFence fence, std::function<void(VkFence)> recycleFn)
+    : mFence(fence), mRecycleFn(recycleFn) {
+}
+
+VulkanCmdFence::~VulkanCmdFence() {
+    if (mRecycleFn != nullptr) {
+        mRecycleFn(mFence);
+    }
+}
+
 std::shared_ptr<VulkanCmdFence> VulkanCmdFence::completed() noexcept {
     auto cmdFence = std::make_shared<VulkanCmdFence>(VK_NULL_HANDLE);
     cmdFence->mStatus = VK_SUCCESS;
     return cmdFence;
 }
 
-FenceStatus VulkanCmdFence::wait(VkDevice device, uint64_t const timeout,
-    std::chrono::steady_clock::time_point const until) {
-
-    // this lock MUST be held for READ when calling vkWaitForFences()
-    std::shared_lock rl(mLock);
-
-    // If the vulkan fence has not been submitted yet, we need to wait for that before we
-    // can use vkWaitForFences()
-    if (mStatus == VK_INCOMPLETE) {
-        bool const success = mCond.wait_until(rl, until, [this] {
-            // Internally we use the VK_INCOMPLETE status to mean "not yet submitted".
-            // When this fence gets submitted, its status changes to VK_NOT_READY.
-            return mStatus != VK_INCOMPLETE || mCanceled;
-        });
-        if (!success) {
-            // !success indicates a timeout or cancel
-            return mCanceled ? FenceStatus::ERROR : FenceStatus::TIMEOUT_EXPIRED;
+void VulkanCmdFence::refreshStatus(VkDevice device) {
+    if (mFence != VK_NULL_HANDLE) {
+        VkResult status = vkGetFenceStatus(device, mFence);
+        if (status == VK_SUCCESS) {
+            setStatus(status);
         }
     }
+}
 
-    // The fence could have already signaled, avoid calling into vkWaitForFences()
-    if (mStatus == VK_SUCCESS) {
-        return FenceStatus::CONDITION_SATISFIED;
-    }
+FenceStatus VulkanCmdFence::wait(VkDevice device, uint64_t const timeout,
+    std::chrono::steady_clock::time_point const until) {
+    {
+        // Hold the fence until we've determined we've checked the status, and
+        // want to wait on the fence.
+        std::shared_lock rl(mLock);
 
-    // Or it could have been canceled, return immediately
-    if (mCanceled) {
-        return FenceStatus::ERROR;
+        // If the vulkan fence has not been submitted yet, we need to wait for that before we
+        // can use vkWaitForFences()
+        if (mStatus == VK_INCOMPLETE) {
+            bool const success = mCond.wait_until(rl, until, [this] {
+                // Internally we use the VK_INCOMPLETE status to mean "not yet submitted".
+                // When this fence gets submitted, its status changes to VK_NOT_READY.
+                return mStatus != VK_INCOMPLETE || mCanceled;
+            });
+            if (!success) {
+                // !success indicates a timeout or cancel
+                return mCanceled ? FenceStatus::ERROR : FenceStatus::TIMEOUT_EXPIRED;
+            }
+        }
+
+        // The fence could have already signaled, avoid calling into vkWaitForFences()
+        if (mStatus == VK_SUCCESS) {
+            return FenceStatus::CONDITION_SATISFIED;
+        }
+
+        // Or it could have been canceled, return immediately
+        if (mCanceled) {
+            return FenceStatus::ERROR;
+        }
     }
 
     // If we're here, we know that vkQueueSubmit has been called (because it sets the status
     // to VK_NOT_READY).
-    // Now really wait for the fence while holding the shared_lock, this allows several
-    // threads to call vkWaitForFences(), but will prevent vkResetFence from taking
-    // place simultaneously. vkResetFence is only called once it knows the fence has signaled,
-    // which guaranties that vkResetFence won't have to wait too long, just enough for
-    // all the vkWaitForFences() to return.
+    // However, since we're going to wait on the fence, and because the fence is guaranteed
+    // to stay in scope as long as this VulkanCmdFence is still alive, we do not need a lock
+    // here.
     VkResult const status = vkWaitForFences(device, 1, &mFence, VK_TRUE, timeout);
     if (status == VK_TIMEOUT) {
         return FenceStatus::TIMEOUT_EXPIRED;
     }
 
     if (status == VK_SUCCESS) {
-        rl.unlock();
-        std::lock_guard const wl(mLock);
-        mStatus = status;
+        setStatus(status);
         return FenceStatus::CONDITION_SATISFIED;
     }
 
     return FenceStatus::ERROR; // not supported
 }
 
-void VulkanCmdFence::resetFence(VkDevice device) {
-    // This lock prevents vkResetFences() from being called simultaneously with vkWaitForFences(),
-    // but by construction, when we're here, we know that the fence has signaled and
-    // vkWaitForFences() will return shortly.
-    std::lock_guard const l(mLock);
-    assert_invariant(mStatus == VK_SUCCESS);
-    vkResetFences(device, 1, &mFence);
+void VulkanCmdFence::swapRecycleFn(std::function<void(VkFence)> recycleFn) {
+    mRecycleFn = recycleFn;
 }
 
 } // namespace filament::backend

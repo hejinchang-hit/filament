@@ -39,9 +39,6 @@ set(LOPTS "${LOPTS} -s FULL_ES3")
 set(LOPTS "${LOPTS} -s MIN_WEBGL_VERSION=2")
 set(LOPTS "${LOPTS} -s MAX_WEBGL_VERSION=2")
 
-if (FILAMENT_SUPPORTS_WEBGPU)
-    set(LOPTS "${LOPTS} --use-port=emdawnwebgpu")
-endif()
 
 foreach (JS_FILENAME ${EXTERN_POSTJS_SRC})
   set(LOPTS "${LOPTS} --extern-post-js ${JS_FILENAME}")
@@ -56,13 +53,13 @@ set_target_properties(filament-js PROPERTIES
     LINK_DEPENDS "${EXTERN_POSTJS_SRC}"
     OUTPUT_NAME filament)
 
-target_link_libraries(filament-js PRIVATE filament math utils ktxreader filameshio uberarchive gltfio_core viewer)
+target_link_libraries(filament-js PRIVATE filament math utils ktxreader filameshio uberarchive gltfio_core viewer camutils)
 
 # Copy package.json (et al) into the output folder to allow "npm publish" to gather the
 # artifacts that it needs.
 
 set(RESOURCES )
-foreach (RESOURCE package.json README.md filament.d.ts filament-viewer.js)
+foreach (RESOURCE package.json README.md filament.d.ts)
     add_custom_command(
         OUTPUT ${PROJECT_BINARY_DIR}/${RESOURCE}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${RESOURCE}

@@ -17,13 +17,12 @@
 #ifndef TNT_FILAMENT_DETAILS_CAMERA_H
 #define TNT_FILAMENT_DETAILS_CAMERA_H
 
-#include <filament/Camera.h>
-
 #include "downcast.h"
 
-#include <filament/Frustum.h>
-
 #include <private/filament/EngineEnums.h>
+
+#include <filament/Camera.h>
+#include <filament/Frustum.h>
 
 #include <utils/compiler.h>
 #include <utils/Entity.h>
@@ -60,7 +59,7 @@ public:
         setCustomProjection(projection, projection, near, far);
     }
 
-    void setCustomEyeProjection(math::mat4 const* projection, size_t count,
+    void setCustomEyeProjection(utils::Slice<const math::mat4> projection,
             math::mat4 const& projectionForCulling, double near, double far);
 
 

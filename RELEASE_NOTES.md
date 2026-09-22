@@ -7,6 +7,82 @@ A new header is inserted each time a *tag* is created.
 Instead, if you are authoring a PR for the main branch, add your release note to
 [NEW_RELEASE_NOTES.md](./NEW_RELEASE_NOTES.md).
 
+## v1.77.2
+
+- build: Keep exceptions enabled for separately built host tools when `build.sh -E` disables exceptions for the target build.
+- vulkan: report depth and stencil render-target format support correctly
+
+## v1.77.1
+
+- backend: add Metal support for external image handles
+
+## v1.77.0
+
+- filament: fix GCC compilation of the NEON color grading path
+- materials: add `iridescence`, `iridescenceIor` and `iridescenceThickness` to the lit shading models
+- filamat: convert DIR variant into a specialization constant. [⚠️ **Recompile Materials**]
+
+## v1.76.1
+
+- backend: re-enable the `backend_test` build on iOS (opt-in via `INSTALL_BACKEND_TEST`) and record its golden-image hashes
+- vulkan: fix very slow `readPixels` on devices without host-cached staging memory (e.g. PowerVR)
+
+## v1.76.0
+
+- backend: async completion callbacks now take a `backend::AsyncCallStatus` argument reporting
+  whether the operation ran (`COMPLETED`) or was canceled (`CANCELED`). Callers chaining work from
+  a completion callback must check it [⚠️ **API Change**]
+- backend: canceling an async call now always invokes its completion callback, with
+  `AsyncCallStatus::CANCELED`. Previously the callback was silently dropped
+- engine: fix picking on PowerVR OpenGL ES drivers that mishandle dynamic uniform-buffer indexing
+  in fragment shaders [⚠️ **Recompile Materials**]
+- engine: support multiple directional lights, opt-in via
+  `Engine::Config::enableMultipleDirectionalLights`; the dominant one still provides shadows and
+  the sun disc, up to 4 additional directional lights are evaluated without shadows [⚠️ **New
+  Material Version**]
+- materials: a second specular lobe can be defined by setting the `secondRoughness` and
+  `secondRoughnessWeight` properties. This can be used to create hazy materials. These properties
+  require material to declare `apiLevel : 2` (or greater).
+- filamat: completely remove the DYN variant bit.[⚠️ **Recompile Materials**]
+
+## v1.75.1
+
+
+## v1.75.0
+
+- web: expand JS bindings coverage for Fence, SkinningBuffer, MorphTargetBuffer, and other previously unbound APIs
+- variant: compile MNT variant for unlit materials by default. [⚠️ **Recompile Materials**]
+- materials: fix punctual-only shadow receivers selecting the SSR shader. [⚠️ **Recompile Materials**]
+
+## v1.74.1
+
+
+## v1.73.1
+
+
+## v1.73.0
+
+- Convert DYN variant into a specialization constant. [⚠️ **Recompile Materials**]
+- filamat: add `clipSpacePosition` material property to vertex domain
+
+## v1.72.1
+
+
+## v1.72.0
+
+- filamat: support push constants in fragment stage [⚠️ **Recompile Materials**]
+
+## v1.71.6
+
+- engine: Optimize Color Grading with NEON on armv8+ devices. Performance improvements between 1.3x and 4.5x
+- New `coloredPenumbra` material property can be used to simulate light scattering in shadow 
+  transitions. See Filament's material guide for more information
+- gltfio: Support textures bound to both sRGB and Linear parameters
+
+## v1.71.5
+
+- Support attribute-less procedural rendering
+
 ## v1.71.4
 
 - iOS: add Apple silicon (`arm64`) iOS Simulator support. The sample Xcode projects now require Xcode 16+ (CI is pinned to Xcode 16.2).

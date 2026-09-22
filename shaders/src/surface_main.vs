@@ -38,7 +38,7 @@ void main() {
 
     // In USE_OPTIMIZED_DEPTH_VERTEX_SHADER mode, we can even skip this if we're already in
     // VERTEX_DOMAIN_DEVICE and we don't have VSM.
-#if !defined(VERTEX_DOMAIN_DEVICE) || defined(VARIANT_HAS_VSM)
+#if !defined(VERTEX_DOMAIN_DEVICE) || defined(VARIANT_HAS_MNT)
     // Run initMaterialVertex to compute material.worldPosition.
     MaterialVertexInputs material;
     initMaterialVertex(material);
@@ -162,12 +162,17 @@ void main() {
     vertex_worldNormal = material.worldNormal;
 #endif
 
-#if defined(VARIANT_HAS_SHADOWING) && defined(VARIANT_HAS_DIRECTIONAL_LIGHTING)
-    vertex_lightSpacePosition = computeLightSpacePosition(
-            vertex_worldPosition.xyz, vertex_worldNormal,
-            frameUniforms.lightDirection,
-            shadowUniforms.shadows[0].normalBias,
-            shadowUniforms.shadows[0].lightFromWorldMatrix);
+#if defined(VARIANT_HAS_SHADOWING) && defined(MATERIAL_HAS_LIGHTING)
+    if (RUNTIME_CONFIG_HAS_DIRECTIONAL_LIGHTING) {
+        vertex_lightSpacePosition = computeLightSpacePosition(
+                vertex_worldPosition.xyz, vertex_worldNormal,
+                frameUniforms.lightDirection,
+                shadowUniforms.shadows[0].normalBias,
+                shadowUniforms.shadows[0].lightFromWorldMatrix);
+    }
+    else {
+        vertex_lightSpacePosition = vec4(0.0);
+    }
 #endif
 
 #endif // !defined(USE_OPTIMIZED_DEPTH_VERTEX_SHADER)
@@ -176,13 +181,13 @@ void main() {
 
 #if defined(VERTEX_DOMAIN_DEVICE)
     // The other vertex domains are handled in initMaterialVertex()->computeWorldPosition()
+#if defined(MATERIAL_HAS_CLIP_SPACE_POSITION) && CLIENT_MATERIAL_API_LEVEL >= UNSTABLE_MATERIAL_API_LEVEL
+    position = material.clipSpacePosition;
+#elif defined(MATERIAL_HAS_CLIP_SPACE_TRANSFORM) && !defined(USE_OPTIMIZED_DEPTH_VERTEX_SHADER)
+    position = getMaterialClipSpaceTransform(material) * getPosition();
+#else
     position = getPosition();
-
-#if !defined(USE_OPTIMIZED_DEPTH_VERTEX_SHADER)
-#if defined(MATERIAL_HAS_CLIP_SPACE_TRANSFORM)
-    position = getMaterialClipSpaceTransform(material) * position;
 #endif
-#endif // !USE_OPTIMIZED_DEPTH_VERTEX_SHADER
 
 #if defined(MATERIAL_HAS_VERTEX_DOMAIN_DEVICE_JITTERED)
     // Apply the clip-space transform which is normally part of the projection
@@ -197,7 +202,10 @@ void main() {
     position.z = position.z * -0.5 + 0.5;
 #endif
 
-#if defined(VARIANT_HAS_VSM)
+#if defined(VARIANT_HAS_MNT)
+    #if !defined(VARIANT_DEPTH)
+    #   error VARIANT_HAS_MNT defined but not VARIANT_DEPTH
+    #endif
     // For VSM, we use the linear light-space Z coordinate as the depth metric, which works for both
     // directional and spot lights and can be safely interpolated.
     // The value is guaranteed to be between [-znear, -zfar] by construction of viewFromWorldMatrix,

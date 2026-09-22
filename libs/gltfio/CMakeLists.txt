@@ -196,7 +196,7 @@ target_include_directories(gltfio_core PUBLIC ${PUBLIC_HDR_DIR})
 set_target_properties(gltfio_core PROPERTIES FOLDER Libs)
 
 target_compile_definitions(gltfio_core PUBLIC -DGLTFIO_DRACO_SUPPORTED=1)
-target_link_libraries(gltfio_core PUBLIC dracodec meshoptimizer ${WEBP_DECODER_LIB_TARGET})
+target_link_libraries(gltfio_core PUBLIC dracodec meshoptimizer zstd ${WEBP_DECODER_LIB_TARGET})
 
 if (WASM_PTHREADS)
     target_compile_definitions(gltfio_core PUBLIC -DFILAMENT_WASM_THREADS)
@@ -253,6 +253,7 @@ if (FILAMENT_BUILD_TESTING)
         add_dependencies(${TEST_TARGET} test_gltfio_files)
         set_property(TARGET test_gltfio PROPERTY LINK_LIBRARIES)
 
+        target_include_directories(${TEST_TARGET} PRIVATE src)
         target_link_libraries(${TEST_TARGET} PRIVATE ${TARGET} gtest uberarchive)
         if (NOT MSVC)
             target_compile_options(${TEST_TARGET} PRIVATE ${GLTFIO_WARNINGS})

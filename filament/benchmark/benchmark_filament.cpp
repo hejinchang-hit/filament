@@ -14,19 +14,30 @@
  * limitations under the License.
  */
 
+#include "Culler.h"
+#include "downcast.h"
 #include "PerformanceCounters.h"
+
+#include "details/Engine.h"
+
+#include <filament/Box.h>
+#include <filament/ColorGrading.h>
+#include <filament/Engine.h>
+#include <filament/Frustum.h>
+#include <filament/LightManager.h>
+#include <filament/RenderableManager.h>
+#include <filament/ToneMapper.h>
+#include <filament/TransformManager.h>
+
+#include <utils/Allocator.h>
+#include <utils/compiler.h>
+#include <utils/EntityManager.h>
+#include <utils/FixedCapacityVector.h>
 
 #include <benchmark/benchmark.h>
 
-
-#include <filament/Box.h>
-#include <filament/Frustum.h>
-#include "Culler.h"
-
-#include <utils/Allocator.h>
-
-#include <vector>
 #include <random>
+#include <vector>
 
 using namespace filament;
 using namespace filament::math;
@@ -41,6 +52,9 @@ protected:
     std::vector<float3> boxesCenter;
     std::vector<float3> boxesExtent;
     std::vector<float4> spheres;
+    std::vector<float> box_cx, box_cy, box_cz;
+    std::vector<float> box_ex, box_ey, box_ez;
+    std::vector<float> sphere_cx, sphere_cy, sphere_cz, sphere_r;
     Culler::result_type* UTILS_RESTRICT visibles = nullptr;
 
 
@@ -56,6 +70,11 @@ public:
         boxesCenter.resize(batch);
         boxesExtent.resize(batch);
         spheres.resize(batch);
+
+        box_cx.resize(batch); box_cy.resize(batch); box_cz.resize(batch);
+        box_ex.resize(batch); box_ey.resize(batch); box_ez.resize(batch);
+        sphere_cx.resize(batch); sphere_cy.resize(batch); sphere_cz.resize(batch); sphere_r.resize(batch);
+
         for (size_t i = 0; i < batch; i++) {
             float4& sphere = spheres[i];
             float z = std::fabs(rand(gen));
@@ -70,21 +89,36 @@ public:
                     rand(gen, std::uniform_real_distribution<float>::param_type{ 0.11f, 25.0f }),
                     rand(gen, std::uniform_real_distribution<float>::param_type{ 0.11f, 25.0f })
             };
+
+            box_cx[i] = boxesCenter[i].x;
+            box_cy[i] = boxesCenter[i].y;
+            box_cz[i] = boxesCenter[i].z;
+            box_ex[i] = boxesExtent[i].x;
+            box_ey[i] = boxesExtent[i].y;
+            box_ez[i] = boxesExtent[i].z;
+
+            sphere_cx[i] = sphere.x;
+            sphere_cy[i] = sphere.y;
+            sphere_cz[i] = sphere.z;
+            sphere_r[i]  = sphere.w;
         }
 
         visibles = (Culler::result_type*)utils::aligned_alloc(batch * sizeof(*visibles), 32);
     }
 
     ~FilamentCullingFixture() override {
-        utils::aligned_free(visibles);
+        aligned_free(visibles);
     }
 };
 
 BENCHMARK_F(FilamentCullingFixture, boxCulling)(benchmark::State& state) {
     {
         PerformanceCounters pc(state);
-        for (auto _ : state) {
-            Culler::Test::intersects(visibles, frustum, boxesCenter.data(), boxesExtent.data(), BATCH_SIZE);
+        for (UTILS_UNUSED auto _ : state) {
+            Culler::Test::intersects(visibles, frustum,
+                    box_cx.data(), box_cy.data(), box_cz.data(),
+                    box_ex.data(), box_ey.data(), box_ez.data(),
+                    BATCH_SIZE);
         }
         benchmark::ClobberMemory();
         pc.stop();
@@ -95,11 +129,366 @@ BENCHMARK_F(FilamentCullingFixture, boxCulling)(benchmark::State& state) {
 BENCHMARK_F(FilamentCullingFixture, sphereCulling)(benchmark::State& state) {
     {
         PerformanceCounters pc(state);
-        for (auto _ : state) {
-            Culler::Test::intersects(visibles, frustum, spheres.data(), BATCH_SIZE);
+        for (UTILS_UNUSED auto _ : state) {
+            Culler::Test::intersects(visibles, frustum,
+                    sphere_cx.data(), sphere_cy.data(), sphere_cz.data(),
+                    sphere_r.data(),
+                    BATCH_SIZE);
         }
         benchmark::ClobberMemory();
         pc.stop();
         state.SetItemsProcessed(state.iterations() * BATCH_SIZE);
     }
+}
+
+class ColorGradingFixture : public benchmark::Fixture {
+protected:
+    Engine* engine = nullptr;
+
+public:
+    static constexpr size_t kMaxAccumulatedLuts = 100;
+
+    void SetUp(const benchmark::State& state) override {
+        Engine::Config config;
+        config.commandBufferSizeMB = 8;
+        engine = Engine::Builder()
+            .backend(Engine::Backend::NOOP)
+            .config(&config)
+            .build();
+    }
+
+    void TearDown(const benchmark::State& state) override {
+        Engine::destroy(&engine);
+    }
+};
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationDefault)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationWithAdjustments)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+        builder.format(ColorGrading::LutFormat::FLOAT)
+               .exposure(0.5f)
+               .contrast(1.1f)
+               .saturation(1.05f);
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationWithAdjustmentsInteger)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+        builder.format(ColorGrading::LutFormat::INTEGER)
+               .exposure(0.5f)
+               .contrast(1.1f)
+               .saturation(1.05f);
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationAdvanced32)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+        builder.format(ColorGrading::LutFormat::INTEGER)
+               .dimensions(32)
+               .exposure(0.5f)
+               .contrast(1.1f)
+               .saturation(1.05f)
+               .nightAdaptation(0.5f)
+               .luminanceScaling(true)
+               .gamutMapping(true);
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+    }
+}
+
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationUltraQuality)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+        builder.quality(ColorGrading::QualityLevel::ULTRA)
+               .exposure(0.5f)
+               .contrast(1.1f);
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 64 * 64 * 64);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationCustomLutBaseline)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+        builder.format(ColorGrading::LutFormat::INTEGER)
+               .dimensions(32)
+               .toneMapping(ColorGrading::ToneMapping::ACES);
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationWithCustomLut)(benchmark::State& state) {
+    {
+        utils::FixedCapacityVector<math::float3> lut(32 * 32 * 32, math::float3{0.5f, 0.5f, 0.5f});
+        ColorGrading::Builder builder;
+        builder.format(ColorGrading::LutFormat::INTEGER)
+               .dimensions(32)
+               .toneMapping(ColorGrading::ToneMapping::ACES)
+               .customLut(std::move(lut), 32);
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGeneration1DLDR)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        builder.toneMapping(ColorGrading::ToneMapping::LINEAR);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 512);
+    }
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGeneration1DHDR)(benchmark::State& state) {
+    {
+        ColorGrading::Builder builder;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        builder.toneMapping(ColorGrading::ToneMapping::FILMIC);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+        std::vector<ColorGrading*> cgs;
+        cgs.reserve(kMaxAccumulatedLuts);
+        PerformanceCounters pc(state);
+        for (UTILS_UNUSED auto _: state) {
+            cgs.push_back(builder.build(*engine));
+        }
+        benchmark::ClobberMemory();
+        pc.stop();
+        for (ColorGrading* cg : cgs) {
+            engine->destroy(cg);
+        }
+        engine->flush();
+        state.SetItemsProcessed(state.iterations() * 512);
+    }
+}
+
+template <typename ToneMapperType>
+void benchmarkToneMapper(Engine* engine, benchmark::State& state) {
+    ToneMapperType tm;
+    ColorGrading::Builder builder;
+    builder.format(ColorGrading::LutFormat::INTEGER)
+           .dimensions(32)
+           .toneMapper(&tm);
+    std::vector<ColorGrading*> cgs;
+    cgs.reserve(ColorGradingFixture::kMaxAccumulatedLuts);
+    PerformanceCounters pc(state);
+    for (auto _ : state) {
+        cgs.push_back(builder.build(*engine));
+    }
+    benchmark::ClobberMemory();
+    pc.stop();
+    for (ColorGrading* cg : cgs) {
+        engine->destroy(cg);
+    }
+    engine->flush();
+    state.SetItemsProcessed(state.iterations() * 32 * 32 * 32);
+}
+
+BENCHMARK_F(ColorGradingFixture, lutGenerationLinear)(benchmark::State& state) {
+    benchmarkToneMapper<LinearToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationACES)(benchmark::State& state) {
+    benchmarkToneMapper<ACESToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationACESLegacy)(benchmark::State& state) {
+    benchmarkToneMapper<ACESLegacyToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationFilmic)(benchmark::State& state) {
+    benchmarkToneMapper<FilmicToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationPBRNeutral)(benchmark::State& state) {
+    benchmarkToneMapper<PBRNeutralToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationGT7)(benchmark::State& state) {
+    benchmarkToneMapper<GT7ToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationAgx)(benchmark::State& state) {
+    benchmarkToneMapper<AgxToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationGeneric)(benchmark::State& state) {
+    benchmarkToneMapper<GenericToneMapper>(engine, state);
+}
+BENCHMARK_F(ColorGradingFixture, lutGenerationDisplayRange)(benchmark::State& state) {
+    benchmarkToneMapper<DisplayRangeToneMapper>(engine, state);
+}
+
+class EngineGcWorstCaseFixture : public benchmark::Fixture {
+protected:
+    Engine* engine = nullptr;
+    EntityManager* em = nullptr;
+    TransformManager* tcm = nullptr;
+    LightManager* lcm = nullptr;
+    RenderableManager* rcm = nullptr;
+
+public:
+    void SetUp(const benchmark::State& state) override {
+        Engine::Config config;
+        engine = Engine::Builder()
+            .backend(Engine::Backend::NOOP)
+            .config(&config)
+            .build();
+        em = &engine->getEntityManager();
+        tcm = &engine->getTransformManager();
+        lcm = &engine->getLightManager();
+        rcm = &engine->getRenderableManager();
+    }
+
+    void TearDown(const benchmark::State& state) override {
+        Engine::destroy(&engine);
+    }
+};
+
+BENCHMARK_F(EngineGcWorstCaseFixture, worstCaseSequentialGc)(benchmark::State& state) {
+    constexpr size_t TOTAL_ENTITIES = 10000;
+    constexpr size_t DESTROYED_ENTITIES = 5000;
+
+    std::vector<Entity> entities(TOTAL_ENTITIES);
+
+    PerformanceCounters pc(state);
+    for (auto _ : state) {
+        state.PauseTiming();
+        for (size_t i = 0; i < TOTAL_ENTITIES; ++i) {
+            entities[i] = em->create();
+            tcm->create(entities[i], 0, mat4f());
+            LightManager::Builder(LightManager::Type::POINT).build(*engine, entities[i]);
+            RenderableManager::Builder(1).boundingBox({{0,0,0},{1,1,1}}).build(*engine, entities[i]);
+            engine->createCamera(entities[i]);
+        }
+        em->advanceEpoch();
+
+        for (size_t i = 0; i < DESTROYED_ENTITIES; ++i) {
+            em->destroy(entities[i]);
+        }
+        em->advanceEpoch();
+
+        state.ResumeTiming();
+
+        downcast(engine)->gc();
+
+        state.PauseTiming();
+        for (size_t i = DESTROYED_ENTITIES; i < TOTAL_ENTITIES; ++i) {
+            em->destroy(entities[i]);
+        }
+        em->advanceEpoch();
+        downcast(engine)->gc();
+        entities.clear();
+        entities.resize(TOTAL_ENTITIES);
+    }
+    pc.stop();
+    state.SetItemsProcessed(state.iterations() * DESTROYED_ENTITIES);
 }

@@ -19,19 +19,22 @@
 
 #include "downcast.h"
 
+#include "details/CreationStatus.h"
+
+#include <filament/MaterialEnums.h>
+#include <filament/VertexBuffer.h>
+
+#include <backend/BufferDescriptor.h>
 #include <backend/DriverEnums.h>
 #include <backend/Handle.h>
 
-#include <filament/VertexBuffer.h>
-
-#include <utils/bitset.h>
-#include <utils/compiler.h>
-
-#include <math/vec2.h>
+#include <utils/debug.h>
 
 #include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <type_traits>
 
 namespace filament {
 
@@ -45,12 +48,16 @@ public:
     using BufferObjectHandle = backend::BufferObjectHandle;
 
     FVertexBuffer(FEngine& engine, const Builder& builder);
-    FVertexBuffer(FEngine& engine, FVertexBuffer* buffer);
 
     // frees driver resources, object becomes invalid
     void terminate(FEngine& engine);
 
-    VertexBufferHandle getHwHandle() const noexcept { return mHandle; }
+    // Only meaningful once the creation succeeded. A canceled asynchronous creation leaves
+    // mHandle referring to backend resources that were never generated.
+    VertexBufferHandle getHwHandle() const noexcept {
+        assert_invariant(isCreationSuccessful());
+        return mHandle;
+    }
 
     VertexBufferInfoHandle getVertexBufferInfoHandle() const { return mVertexBufferInfoHandle; }
 
@@ -70,16 +77,29 @@ public:
             void* user = nullptr);
 
     void setBufferObjectAt(FEngine& engine, uint8_t bufferIndex,
-            FBufferObject const * bufferObject);
+            FBufferObject const* bufferObject);
 
     AsyncCallId setBufferObjectAtAsync(FEngine& engine, uint8_t bufferIndex,
-            FBufferObject const * bufferObject, backend::CallbackHandler* handler,
+            FBufferObject const* bufferObject, backend::CallbackHandler* handler,
             AsyncCompletionCallback callback, void* user = nullptr);
 
     void updateBoneIndicesAndWeights(FEngine& engine, std::unique_ptr<uint16_t[]> skinJoints,
                                         std::unique_ptr<float[]> skinWeights);
 
-    bool isCreationComplete() const noexcept { return mCreationComplete.load(std::memory_order_relaxed); }
+    // Whether the asynchronous pipeline is done with this object, whether or not it succeeded.
+    // This is a *lifetime* gate: FEngine::destroy detects this method by name and waits on it
+    // before freeing the object, so it must become true even when creation is canceled.
+    // Use isCreationSuccessful() to know whether the resource can be used.
+    bool isCreationSettled() const noexcept {
+        return mCreationStatus.load(std::memory_order_relaxed) != CreationStatus::CREATING;
+    }
+
+    // Whether creation finished *and* actually populated the resource. A canceled creation
+    // finishes without ever running, so the resource is not usable. This is what the public
+    // VertexBuffer::isCreationComplete() reports.
+    bool isCreationSuccessful() const noexcept {
+        return mCreationStatus.load(std::memory_order_relaxed) == CreationStatus::CREATED;
+    }
 
 private:
     friend class VertexBuffer;
@@ -87,16 +107,20 @@ private:
     VertexBufferHandle mHandle;
     backend::AttributeArray mAttributes;
     std::array<BufferObjectHandle, backend::MAX_VERTEX_BUFFER_COUNT> mBufferObjects;
+    // Byte capacity of each slot's buffer object, as computed from the declared attributes at
+    // construction time. Only populated for slots this VertexBuffer allocated itself, i.e. when
+    // mBufferObjectsEnabled is false (or for the skinning slots in advanced skinning mode);
+    // client-supplied buffer objects are validated by FBufferObject::setBuffer() instead.
+    std::array<uint32_t, backend::MAX_VERTEX_BUFFER_COUNT> mBufferSizes = {};
     AttributeBitset mDeclaredAttributes;
     uint32_t mVertexCount = 0;
     uint8_t mBufferCount = 0;
     bool mBufferObjectsEnabled = false;
     bool mAdvancedSkinningEnabled = false;
 
-    // This field is set to true when the creation process is complete. This is especially useful
-    // asynchronous creation. If we can guarantee that this field is only referenced by the main
-    // thread, we don't have to use atomic here.
-    std::atomic_bool mCreationComplete{ false };
+    // Where the creation process is. This is especially useful for asynchronous creation; it only
+    // ever moves out of CREATING once, to one of the two terminal states.
+    std::atomic<CreationStatus> mCreationStatus{ CreationStatus::CREATING };
 };
 
 FILAMENT_DOWNCAST(VertexBuffer)

@@ -19,22 +19,22 @@
 
 // This needs to be at the top
 #include "DriverBase.h"
-
 #include "VulkanAsyncHandles.h"
 #include "VulkanBufferCache.h"
 #include "VulkanBufferProxy.h"
 #include "VulkanFboCache.h"
 #include "VulkanSwapChain.h"
 #include "VulkanTexture.h"
-#include "vulkan/VulkanCommands.h"
+
 #include "vulkan/memory/Resource.h"
 #include "vulkan/memory/ResourcePointer.h"
 #include "vulkan/utils/Definitions.h"
+#include "vulkan/VulkanCommands.h"
 
+#include <utils/bitset.h>
 #include <utils/FixedCapacityVector.h>
 #include <utils/Mutex.h>
 #include <utils/StructureOfArrays.h>
-#include <utils/bitset.h>
 
 #include <array>
 
@@ -44,13 +44,10 @@ namespace {
 // Counts the total number of descriptors for both vertex and fragment stages.
 template<typename Bitmask>
 inline uint8_t collapsedCount(Bitmask const& mask) {
-    static_assert(sizeof(mask) <= 64);
-    constexpr uint64_t VERTEX_MASK = (1ULL << fvkutils::getFragmentStageShift<Bitmask>()) - 1ULL;
-    constexpr uint64_t FRAGMENT_MASK = (VERTEX_MASK << fvkutils::getFragmentStageShift<Bitmask>());
-    uint64_t val = mask.getValue();
-    val = ((val & VERTEX_MASK) >> fvkutils::getVertexStageShift<Bitmask>()) |
-          ((val & FRAGMENT_MASK) >> fvkutils::getFragmentStageShift<Bitmask>());
-    return (uint8_t) Bitmask(val).count();
+    Bitmask collapsed;
+    size_t const shift = fvkutils::getFragmentStageShift<Bitmask>();
+    mask.forEachSetBit([&](size_t index) { collapsed.set(index % shift); });
+    return (uint8_t) collapsed.count();
 }
 
 } // anonymous namespace
@@ -61,20 +58,20 @@ struct VulkanBufferObject;
 
 struct VulkanDescriptorSetLayout : public HwDescriptorSetLayout, fvkmemory::Resource {
     static constexpr uint8_t UNIQUE_DESCRIPTOR_SET_COUNT = 4;
-    static constexpr uint8_t MAX_BINDINGS = 25;
+    static constexpr uint8_t MAX_BINDINGS = filament::backend::MAX_DESCRIPTOR_COUNT;
 
     using DescriptorSetLayoutArray = std::array<VkDescriptorSetLayout,
             VulkanDescriptorSetLayout::UNIQUE_DESCRIPTOR_SET_COUNT>;
 
     // The bitmask representation of a set layout.
     struct Bitmask {
-        fvkutils::UniformBufferBitmask ubo;         // 8 bytes
-        fvkutils::UniformBufferBitmask dynamicUbo;  // 8 bytes
-        fvkutils::SamplerBitmask sampler;           // 8 bytes
-        fvkutils::InputAttachmentBitmask inputAttachment; // 8 bytes
+        fvkutils::UniformBufferBitmask ubo;               // 16 bytes
+        fvkutils::UniformBufferBitmask dynamicUbo;        // 16 bytes
+        fvkutils::SamplerBitmask sampler;                 // 16 bytes
+        fvkutils::InputAttachmentBitmask inputAttachment; // 16 bytes
 
         // This is a subset of the sampler field.
-        fvkutils::SamplerBitmask externalSampler; // 8 bytes
+        fvkutils::SamplerBitmask externalSampler; // 16 bytes
 
         bool operator==(Bitmask const& right) const {
             return ubo == right.ubo && dynamicUbo == right.dynamicUbo && sampler == right.sampler &&
@@ -84,7 +81,7 @@ struct VulkanDescriptorSetLayout : public HwDescriptorSetLayout, fvkmemory::Reso
 
         static Bitmask fromLayoutDescription(DescriptorSetLayout const& layout);
     };
-    static_assert(sizeof(Bitmask) == 40);
+    static_assert(sizeof(Bitmask) == 80);
 
     // This is a convenience struct to quickly check layout compatibility in terms of descriptor set
     // pools.
@@ -279,9 +276,20 @@ struct VulkanRenderTarget : private HwRenderTarget, fvkmemory::Resource {
         return {width, height};
     }
 
-    inline VulkanAttachment& getColor0() const {
-        assert_invariant(mInfo->colors[0]);
-        return mInfo->attachments[0];
+    // Cached classification of each color attachment's clear semantics. Computed once when the
+    // attachment is bound to the render target and used on the clear path.
+    enum class ColorClearKind : uint8_t { Float, SignedInt, UnsignedInt };
+
+    // Returns the i-th color attachment, packed at the start of `attachments` in MRT-slot order.
+    inline VulkanAttachment& getColor(uint32_t idx) const {
+        assert_invariant(idx < mInfo->colors.count());
+        return mInfo->attachments[idx];
+    }
+
+    // Returns the cached clear-kind for the i-th color attachment.
+    inline ColorClearKind getColorClearKind(uint32_t idx) const {
+        assert_invariant(idx < mInfo->colors.count());
+        return mInfo->colorClearKinds[idx];
     }
 
     inline VulkanAttachment& getDepthStencil() const {
@@ -340,6 +348,8 @@ private:
         VulkanFboCache::RenderPassKey rpkey = {};
         VulkanFboCache::FboKey fbkey = {};
         std::vector<VulkanAttachment> attachments;
+        // Parallel to attachments[0..colors.count()-1]: cached clear-kind per color attachment.
+        std::array<ColorClearKind, MRT::MAX_SUPPORTED_RENDER_TARGET_COUNT> colorClearKinds = {};
         utils::bitset32 colors;
         int8_t depthStencilIndex = UNDEFINED_INDEX;
         int8_t msaaDepthStencilIndex = UNDEFINED_INDEX;
@@ -354,6 +364,12 @@ private:
 struct VulkanBufferObject;
 
 struct VulkanVertexBufferInfo : public HwVertexBufferInfo, fvkmemory::Resource {
+
+    using AttributeBitSet = utils::bitset32;
+    // This ensures that we have a bit for each of the attribute index, which ranges from
+    // [0, MAX_VERTEX_ATTRIBUTE_COUNT).
+    static_assert(sizeof(AttributeBitSet) * 8 >= MAX_VERTEX_ATTRIBUTE_COUNT);
+
     VulkanVertexBufferInfo(uint8_t bufferCount, uint8_t attributeCount,
             AttributeArray const& attributes);
 
@@ -377,6 +393,10 @@ struct VulkanVertexBufferInfo : public HwVertexBufferInfo, fvkmemory::Resource {
         return mInfo.mSoa.size();
     }
 
+    AttributeBitSet getDeclaredAttributes() const noexcept {
+        return mAttributes;
+    }
+
 private:
     struct PipelineInfo {
         PipelineInfo(size_t size) : mSoa(size /* capacity */) {
@@ -397,6 +417,8 @@ private:
         > mSoa;
     };
 
+    // Tracks which attributes have been declared for the vbo.
+    AttributeBitSet mAttributes;
     PipelineInfo mInfo;
 };
 
@@ -412,9 +434,15 @@ struct VulkanVertexBuffer : public HwVertexBuffer, fvkmemory::Resource {
     inline VkBuffer* getVkBuffers() { return mBuffers.data(); }
     fvkmemory::resource_ptr<VulkanVertexBufferInfo> vbi;
 
+    // Returns whether all the declared attributes have a buffer attached.
+    bool isValid() const noexcept {
+        return mAttributes == vbi->getDeclaredAttributes();
+    }
+
 private:
     utils::FixedCapacityVector<VkBuffer> mBuffers;
     std::vector<fvkmemory::resource_ptr<VulkanBufferObject>> mResources;
+    VulkanVertexBufferInfo::AttributeBitSet mAttributes;
 };
 
 struct VulkanIndexBuffer : public HwIndexBuffer, fvkmemory::Resource {

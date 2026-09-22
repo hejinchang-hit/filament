@@ -17,6 +17,7 @@
 #include "OpenGLDriver.h"
 
 #include "CommandStreamDispatcher.h"
+#include "gl_headers.h"
 #include "GLMemoryMappedBuffer.h"
 #include "GLTexture.h"
 #include "GLUtils.h"
@@ -26,9 +27,10 @@
 #include "OpenGLState.h"
 #include "OpenGLTimerQuery.h"
 #include "SystraceProfile.h"
-#include "gl_headers.h"
 
-#include <backend/platforms/OpenGLPlatform.h>
+#include <private/backend/CommandStream.h>
+#include <private/backend/Dispatcher.h>
+#include <private/backend/DriverApi.h>
 
 #include <backend/BufferDescriptor.h>
 #include <backend/CallbackHandler.h>
@@ -38,31 +40,32 @@
 #include <backend/Handle.h>
 #include <backend/PipelineState.h>
 #include <backend/Platform.h>
+#include <backend/platforms/OpenGLPlatform.h>
 #include <backend/Program.h>
 #include <backend/TargetBufferInfo.h>
 
-#include "private/backend/CommandStream.h"
-#include "private/backend/Dispatcher.h"
-#include "private/backend/DriverApi.h"
-
+#include <private/utils/FeatureFlagManager.h>
 #include <private/utils/Tracing.h>
 
-#include <type_traits>
 #include <utils/BitmaskEnum.h>
+#include <utils/compiler.h>
 #include <utils/CString.h>
-#include <utils/ImmutableCString.h>
+#include <utils/debug.h>
 #include <utils/FixedCapacityVector.h>
+#include <utils/ImmutableCString.h>
 #include <utils/Invocable.h>
 #include <utils/Logger.h>
+#include <utils/ostream.h>
 #include <utils/Panic.h>
 #include <utils/Slice.h>
-#include <utils/compiler.h>
-#include <utils/debug.h>
-#include <utils/ostream.h>
 
+#include <math/mat3.h>
 #include <math/vec2.h>
 #include <math/vec3.h>
-#include <math/mat3.h>
+
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -78,10 +81,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if defined(__EMSCRIPTEN__)
-#include <emscripten.h>
-#endif
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -289,15 +288,20 @@ OpenGLDriver::DebugMarker::~DebugMarker() noexcept {
 
 // ------------------------------------------------------------------------------------------------
 
-OpenGLDriver::OpenGLDriver(OpenGLPlatform* platform, const Platform::DriverConfig& driverConfig) noexcept
+OpenGLDriver::OpenGLDriver(OpenGLPlatform* platform,
+        const Platform::DriverConfig& driverConfig) noexcept
         : OpenGLDriverBase(driverConfig),
           mPlatform(*platform),
           mContext(mPlatform, driverConfig),
           mShaderCompilerService(*this),
-          mHandleAllocator("Handles",
-                  driverConfig.handleArenaSize,
-                  driverConfig.disableHandleUseAfterFreeCheck,
-                  driverConfig.disableHeapHandleTags),
+          mHandleAllocator("Handles", driverConfig.handleArenaSize,
+                  (driverConfig.featureFlagManager
+                                  ? driverConfig.featureFlagManager->features.backend
+                                            .disable_handle_use_after_free_check
+                                  : false),
+                  (driverConfig.featureFlagManager ? driverConfig.featureFlagManager->features
+                                                             .backend.disable_heap_handle_tags
+                                                   : false)),
           mCurrentPushConstants(new(std::nothrow) PushConstantBundle{}) {
     // set a reasonable default value for our stream array
     mTexturesWithStreamsAttached.reserve(8);
@@ -317,12 +321,28 @@ OpenGLDriver::OpenGLDriver(OpenGLPlatform* platform, const Platform::DriverConfi
 
     mShaderCompilerService.init();
 
+    // Create the backend thread's state after mContext is fully initialized
+    mBackendState = mContext.createState();
+    assert_invariant(mBackendState);
+
     if (driverConfig.asynchronousMode != AsynchronousMode::NONE) {
         mJobQueue = JobQueue::create();
 
-        bool const useThreadWorker =
-                (driverConfig.asynchronousMode == AsynchronousMode::THREAD_PREFERRED) &&
-                UTILS_HAS_THREADING;
+        // The threaded worker needs its own GL context shared with the main one. If the platform
+        // doesn't support extra contexts, createContext() is a no-op and the worker would issue
+        // GL commands without a current context, so fall back to the amortization mode.
+        bool const threadWorkerRequested =
+                driverConfig.asynchronousMode == AsynchronousMode::THREAD_PREFERRED;
+
+        bool const useThreadWorker = threadWorkerRequested &&
+                UTILS_HAS_THREADING && mPlatform.isExtraContextSupported();
+
+        if (UTILS_UNLIKELY(threadWorkerRequested && !useThreadWorker)) {
+            LOG(INFO) << "Asynchronous mode: THREAD_PREFERRED requested, but "
+                      << (UTILS_HAS_THREADING ? "the platform doesn't support additional GL "
+                                                "contexts" : "threading is not available")
+                      << ". Falling back to amortization on the backend thread.";
+        }
 
         if (useThreadWorker) {
             ThreadWorker::Config threadWorkerConfig{
@@ -341,13 +361,12 @@ OpenGLDriver::OpenGLDriver(OpenGLPlatform* platform, const Platform::DriverConfi
             };
             mJobWorker = ThreadWorker::create(mJobQueue, std::move(threadWorkerConfig));
         } else {
+            // The worker operates on the same backend (engine) thread for the Amortization mode,
+            // so use the same state.
+            mWorkerState = mBackendState;
             mJobWorker = AmortizationWorker::create(mJobQueue);
         }
     }
-
-    // Create the backend thread's state after mContext is fully initialized
-    mBackendState = mContext.createState();
-    assert_invariant(mBackendState);
 }
 
 OpenGLDriver::~OpenGLDriver() noexcept { // NOLINT(modernize-use-equals-default)
@@ -403,12 +422,13 @@ void OpenGLDriver::terminate() {
     if (getJobWorker()) {
         getJobWorker()->terminate();
     }
-    // wait for the GPU again because JobWorker might have queued more work.
-    glFinish();
-
     if constexpr (UTILS_HAS_THREADING) {
+        // Flush any callbacks the drained jobs posted via scheduleCallback().
         stopServiceThread();
     }
+
+    // wait for the GPU again because JobWorker might have queued more work.
+    glFinish();
 
     mContext.destroyState(mBackendState);
     mBackendState = nullptr;
@@ -625,6 +645,10 @@ Handle<HwVertexBuffer> OpenGLDriver::createVertexBufferS() noexcept {
     return initHandle<GLVertexBuffer>();
 }
 
+Handle<HwVertexBuffer> OpenGLDriver::createVertexBufferAsyncS() noexcept {
+    return initHandle<GLVertexBuffer>();
+}
+
 Handle<HwIndexBuffer> OpenGLDriver::createIndexBufferS() noexcept {
     return initHandle<GLIndexBuffer>();
 }
@@ -775,8 +799,29 @@ void OpenGLDriver::createVertexBufferR(
         Handle<HwVertexBufferInfo> vbih,
         ImmutableCString&& tag) {
     DEBUG_MARKER()
-    construct<GLVertexBuffer>(vbh, vertexCount, vbih);
+    construct<GLVertexBuffer>(vbh, vertexCount, vbih, false);
     mHandleAllocator.associateTagToHandle(vbh.getId(), std::move(tag));
+}
+
+void OpenGLDriver::createVertexBufferAsyncR(Handle<HwVertexBuffer> vbh,
+        uint32_t vertexCount, Handle<HwVertexBufferInfo> vbih,
+        CallbackHandler* handler, AsyncCallback const callback,
+        void* user, ImmutableCString&& tag) {
+    // For object creation, the object should be constructed first to determine the initial settings
+    // early. For example, the `asynchronous` field needs to be decided at this stage so that
+    // subsequent backend APIs can handle operations based on this setting.
+    construct<GLVertexBuffer>(vbh, vertexCount, vbih, true);
+    mHandleAllocator.associateTagToHandle(vbh.getId(), std::move(tag));
+
+    assert_invariant(getJobQueue());
+
+    // The job push is ordering-only: no GL commands are issued in the worker
+    // thread (createVertexBuffer doesn't allocate GPU memory). The push exists
+    // to fire the callback after any previously-queued worker jobs.
+    getJobQueue()->push([this, handler, callback, user]() mutable {
+        DEBUG_MARKER_NAME("createVertexBufferAsyncR")
+        scheduleAsyncCallback(handler, callback, user, AsyncCallStatus::COMPLETED);
+    });
 }
 
 void OpenGLDriver::createIndexBufferCommon(OpenGLState& gl, Handle<HwIndexBuffer> ibh, ElementType const elementType,
@@ -814,7 +859,7 @@ void OpenGLDriver::createIndexBufferAsyncR(
         ElementType const elementType,
         uint32_t indexCount,
         BufferUsage const usage,
-        CallbackHandler* handler, CallbackHandler::Callback const callback, void* user,
+        CallbackHandler* handler, AsyncCallback const callback, void* user,
         ImmutableCString&& tag) {
     uint8_t const elementSize = static_cast<uint8_t>(getElementTypeSize(elementType));
     // For object creation, the object should be constructed first to determine the initial settings
@@ -832,7 +877,7 @@ void OpenGLDriver::createIndexBufferAsyncR(
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        scheduleAsyncCallback(handler, callback, user, AsyncCallStatus::COMPLETED);
     });
 }
 
@@ -873,7 +918,7 @@ void OpenGLDriver::createBufferObjectR(Handle<HwBufferObject> boh, uint32_t byte
 
 void OpenGLDriver::createBufferObjectAsyncR(Handle<HwBufferObject> boh, uint32_t byteCount,
         BufferObjectBinding bindingType, BufferUsage usage, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user, ImmutableCString&& tag) {
+        AsyncCallback const callback, void* user, ImmutableCString&& tag) {
     // For object creation, the object should be constructed first to determine the initial settings
     // early. For example, the `asynchronous` field needs to be decided at this stage so that
     // subsequent backend APIs can handle operations based on this setting.
@@ -889,7 +934,7 @@ void OpenGLDriver::createBufferObjectAsyncR(Handle<HwBufferObject> boh, uint32_t
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        scheduleAsyncCallback(handler, callback, user, AsyncCallStatus::COMPLETED);
     });
 }
 
@@ -900,13 +945,8 @@ void OpenGLDriver::createRenderPrimitiveR(Handle<HwRenderPrimitive> rph,
 
     auto& gl = getBackendState();
 
-    GLIndexBuffer const* const ib = handle_cast<const GLIndexBuffer*>(ibh);
-    assert_invariant(ib->elementSize == 2 || ib->elementSize == 4);
-
     GLVertexBuffer const* const vb = handle_cast<GLVertexBuffer*>(vbh);
     GLRenderPrimitive* const rp = handle_cast<GLRenderPrimitive*>(rph);
-    rp->gl.indicesShift = (ib->elementSize == 4u) ? 2u : 1u;
-    rp->gl.indicesType  = (ib->elementSize == 4u) ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
     rp->gl.vertexBufferWithObjects = vbh;
     rp->type = pt;
     rp->vbih = vb->vbih;
@@ -924,8 +964,17 @@ void OpenGLDriver::createRenderPrimitiveR(Handle<HwRenderPrimitive> rph,
     // later in draw() or bindRenderPrimitive(). At this point, the HwVertexBuffer might not
     // have all its buffers set.
 
-    // this records the index buffer into the currently bound VAO
-    gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl.buffer);
+    // The index buffer handle is optional: a null `ibh` indicates an attribute-less /
+    // non-indexed render primitive. In that case we leave the VAO's GL_ELEMENT_ARRAY_BUFFER
+    // unbound and skip the indexShift/Type setup — the draw call will use glDrawArrays*.
+    if (ibh) {
+        GLIndexBuffer const* const ib = handle_cast<const GLIndexBuffer*>(ibh);
+        assert_invariant(ib->elementSize == 2 || ib->elementSize == 4);
+        rp->gl.indicesShift = (ib->elementSize == 4u) ? 2u : 1u;
+        rp->gl.indicesType  = (ib->elementSize == 4u) ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
+        // this records the index buffer into the currently bound VAO
+        gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl.buffer);
+    }
 
     CHECK_GL_ERROR()
     mHandleAllocator.associateTagToHandle(rph.getId(), std::move(tag));
@@ -1071,6 +1120,15 @@ void OpenGLDriver::createTextureCommon(OpenGLState& gl, Handle<HwTexture> th, Sa
             // on ES2, format and internal format must match
             // FIXME: handle compressed texture format
             internalFormat = textureFormatToFormatAndType(format).first;
+#if !defined(FILAMENT_IOS)
+            if (mContext.ext.EXT_texture_sRGB) {
+                if (format == TextureFormat::SRGB8_A8) {
+                    internalFormat = GL_SRGB_ALPHA_EXT;
+                } else if (format == TextureFormat::SRGB8) {
+                    internalFormat = GL_SRGB_EXT;
+                }
+            }
+#endif  // !defined(FILAMENT_IOS)
         }
 
         if (UTILS_UNLIKELY(t->target == SamplerType::SAMPLER_EXTERNAL)) {
@@ -1149,7 +1207,7 @@ void OpenGLDriver::createTextureR(Handle<HwTexture> th, SamplerType target, uint
 
 void OpenGLDriver::createTextureAsyncR(Handle<HwTexture> th, SamplerType target, uint8_t levels,
         TextureFormat format, uint8_t samples, uint32_t width, uint32_t height, uint32_t depth,
-        TextureUsage usage, CallbackHandler* handler, CallbackHandler::Callback const callback,
+        TextureUsage usage, CallbackHandler* handler, AsyncCallback const callback,
         void* user, ImmutableCString&& tag) {
     // For object creation, the object should be constructed first to determine the initial settings
     // early. For example, the `asynchronous` field needs to be decided at this stage so that
@@ -1167,7 +1225,7 @@ void OpenGLDriver::createTextureAsyncR(Handle<HwTexture> th, SamplerType target,
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        scheduleAsyncCallback(handler, callback, user, AsyncCallStatus::COMPLETED);
     });
 }
 
@@ -1201,10 +1259,8 @@ void OpenGLDriver::createTextureViewR(Handle<HwTexture> th,
     t->gl.sidecarSamples = 1;
 
     auto srcBaseLevel = src->gl.baseLevel;
-    auto srcMaxLevel = src->gl.maxLevel;
-    if (srcBaseLevel > srcMaxLevel) {
+    if (srcBaseLevel > src->gl.maxLevel) {
         srcBaseLevel = 0;
-        srcMaxLevel = 127;
     }
     t->gl.baseLevel = int8_t(std::min(127, srcBaseLevel + baseLevel));
     t->gl.maxLevel  = int8_t(std::min(127, srcBaseLevel + baseLevel + levelCount - 1));
@@ -1293,7 +1349,7 @@ void OpenGLDriver::createTextureViewSwizzleR(Handle<HwTexture> th, Handle<HwText
 
 void OpenGLDriver::createTextureViewSwizzleAsyncR(Handle<HwTexture> th, Handle<HwTexture> srch,
         TextureSwizzle const r, TextureSwizzle const g, TextureSwizzle const b, TextureSwizzle const a,
-        CallbackHandler* handler, CallbackHandler::Callback const callback, void* user,
+        CallbackHandler* handler, AsyncCallback const callback, void* user,
         ImmutableCString&& tag) {
     // For object creation, the object should be constructed first to determine the initial settings
     // early. For example, the `asynchronous` field needs to be decided at this stage so that
@@ -1312,7 +1368,7 @@ void OpenGLDriver::createTextureViewSwizzleAsyncR(Handle<HwTexture> th, Handle<H
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        scheduleAsyncCallback(handler, callback, user, AsyncCallStatus::COMPLETED);
     });
 }
 
@@ -1333,7 +1389,17 @@ void OpenGLDriver::createTextureExternalImage2R(Handle<HwTexture> th, SamplerTyp
     }
     assert_invariant(internalFormat);
 
-    GLTexture* const t = construct<GLTexture>(th, target, 1, 1, width, height, 1, format, usage, false);
+    uint8_t levels = mPlatform.getExternalImageMipLevels(image); // 1 unless mipmap-complete
+    assert_invariant(levels >= 1);
+    if (UTILS_UNLIKELY(levels > 1 && target != SamplerType::SAMPLER_2D)) {
+        // Only a GL_TEXTURE_2D import can be mipmapped: GL_TEXTURE_EXTERNAL_OES doesn't support
+        // mipmaps and its material sampler is authored as samplerExternalOES, which cannot be
+        // bound to a GL_TEXTURE_2D. Keep those imports single-level.
+        LOG(WARNING) << "External image has mipmaps, but the texture is not SAMPLER_2D; only "
+                        "the base level will be sampled.";
+        levels = 1;
+    }
+    GLTexture* const t = construct<GLTexture>(th, target, levels, 1, width, height, 1, format, usage, false);
     assert_invariant(t);
 
     t->externalTexture = mPlatform.createExternalImageTexture();
@@ -1348,6 +1414,9 @@ void OpenGLDriver::createTextureExternalImage2R(Handle<HwTexture> th, SamplerTyp
         } else {
             t->externalTexture->target = getTextureTargetNotExternal(target);
         }
+        // tell the platform how many levels we sized this texture for, so that it imports the
+        // image with a matching number of levels.
+        t->externalTexture->levels = levels;
 
         t->gl.target = t->externalTexture->target;
         t->gl.id = t->externalTexture->id;
@@ -1355,12 +1424,12 @@ void OpenGLDriver::createTextureExternalImage2R(Handle<HwTexture> th, SamplerTyp
         // because it's not used anywhere for anything important.
         t->gl.internalFormat = internalFormat;
         t->gl.baseLevel = 0;
-        t->gl.maxLevel = 0;
+        t->gl.maxLevel = levels - 1;
         t->gl.external = true; // forces bindTexture() call (they're never cached)
     }
 
     bindTexture(OpenGLContext::DUMMY_TEXTURE_BINDING, t);
-    if (mPlatform.setExternalImage(image, t->externalTexture)) {
+    if (t->externalTexture && mPlatform.setExternalImage(image, t->externalTexture)) {
         // the target and id can be reset each time
         t->gl.target = t->externalTexture->target;
         t->gl.id = t->externalTexture->id;
@@ -1411,7 +1480,7 @@ void OpenGLDriver::createTextureExternalImageR(Handle<HwTexture> th, SamplerType
     }
 
     bindTexture(OpenGLContext::DUMMY_TEXTURE_BINDING, t);
-    if (mPlatform.setExternalImage(image, t->externalTexture)) {
+    if (t->externalTexture && mPlatform.setExternalImage(image, t->externalTexture)) {
         // the target and id can be reset each time
         t->gl.target = t->externalTexture->target;
         t->gl.id = t->externalTexture->id;
@@ -1428,8 +1497,8 @@ void OpenGLDriver::createTextureExternalImagePlaneR(Handle<HwTexture> th,
 void OpenGLDriver::importTextureCommon(OpenGLState& gl, Handle<HwTexture> th, intptr_t const id,
         SamplerType target, uint8_t levels, TextureFormat format, uint8_t samples,
         uint32_t width, uint32_t height, uint32_t depth, TextureUsage usage, ImmutableCString&& tag) {
-    samples = std::clamp(samples, uint8_t(1u), uint8_t(gl.gets.max_samples));
     GLTexture* t = handle_cast<GLTexture*>(th);
+    t->samples = std::clamp(samples, uint8_t(1u), uint8_t(gl.gets.max_samples));
 
     t->gl.id = GLuint(id);
     t->gl.imported = true;
@@ -1497,7 +1566,7 @@ void OpenGLDriver::importTextureR(Handle<HwTexture> th, intptr_t const id,
 void OpenGLDriver::importTextureAsyncR(Handle<HwTexture> th, intptr_t const id,
         SamplerType target, uint8_t levels, TextureFormat format, uint8_t samples,
         uint32_t width, uint32_t height, uint32_t depth, TextureUsage usage,
-        CallbackHandler* handler, CallbackHandler::Callback const callback, void* user,
+        CallbackHandler* handler, AsyncCallback const callback, void* user,
         ImmutableCString&& tag) {
 
     // For object creation, the object should be constructed first to determine the initial settings
@@ -1516,7 +1585,7 @@ void OpenGLDriver::importTextureAsyncR(Handle<HwTexture> th, intptr_t const id,
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        scheduleAsyncCallback(handler, callback, user, AsyncCallStatus::COMPLETED);
     });
 }
 
@@ -1545,8 +1614,12 @@ void OpenGLDriver::updateVertexArrayObject(GLRenderPrimitive* rp, GLVertexBuffer
         const auto& attribute = vbi->attributes[i];
         const uint8_t bi = attribute.buffer;
         if (bi != Attribute::BUFFER_UNUSED) {
-            // if a buffer is defined it must not be invalid.
-            assert_invariant(vb->gl.buffers[bi]);
+            if (UTILS_VERY_UNLIKELY(!vb->gl.buffers[bi])) {
+                // if a buffer is defined it must not be invalid, we try to gracefully handle it though
+                // since it is a situation the user can easily create, and can't be easily caught on
+                // the filament frontend.
+                continue;
+            }
 
             // if we're on ES2, the user shouldn't use FLAG_INTEGER_TARGET
             assert_invariant(!(gl.isES2() && (attribute.flags & Attribute::FLAG_INTEGER_TARGET)));
@@ -2016,6 +2089,10 @@ void OpenGLDriver::createRenderTargetR(Handle<HwRenderTarget> rth,
             if (any(targets & getTargetBufferFlagsAt(i))) {
                 assert_invariant(color[i].handle);
                 rt->gl.color[i] = handle_cast<GLTexture*>(color[i].handle);
+                TextureFormat const format = rt->gl.color[i]->format;
+                rt->gl.colorClearKind[i] = isUnsignedIntFormat(format) ?
+                        ColorClearKind::UnsignedInt : isSignedIntFormat(format) ?
+                                ColorClearKind::SignedInt : ColorClearKind::Float;
                 framebufferTexture(color[i], rt, GL_COLOR_ATTACHMENT0 + i, layerCount);
                 bufs[i] = GL_COLOR_ATTACHMENT0 + i;
                 checkDimensions(rt->gl.color[i], color[i].level);
@@ -2224,11 +2301,22 @@ void OpenGLDriver::destroyVertexBufferInfo(Handle<HwVertexBufferInfo> vbih) {
     }
 }
 
+void OpenGLDriver::destroyVertexBufferCommon(Handle<HwVertexBuffer> vbh) {
+    GLVertexBuffer const* vb = handle_cast<const GLVertexBuffer*>(vbh);
+    destruct(vbh, vb);
+}
+
 void OpenGLDriver::destroyVertexBuffer(Handle<HwVertexBuffer> vbh) {
     DEBUG_MARKER()
     if (vbh) {
         GLVertexBuffer const* vb = handle_cast<const GLVertexBuffer*>(vbh);
-        destruct(vbh, vb);
+        if (vb->asynchronous) {
+            getJobQueue()->push([this, vbh]() {
+                destroyVertexBufferCommon(vbh);
+            });
+        } else {
+            destroyVertexBufferCommon(vbh);
+        }
     }
 }
 
@@ -2419,6 +2507,22 @@ void OpenGLDriver::destroySwapChain(Handle<HwSwapChain> sch) {
         GLSwapChain const* sc = handle_cast<GLSwapChain*>(sch);
         mPlatform.destroySwapChain(sc->swapChain);
         destruct(sch, sc);
+    }
+}
+
+void OpenGLDriver::setFrameRate(Handle<HwSwapChain> sch, float const frameRate,
+        Platform::FrameRateCompatibility const compatibility,
+        Platform::ChangeFrameRateStrategy const strategy) {
+    DEBUG_MARKER()
+
+    if (sch) {
+        GLSwapChain const* const sc = handle_cast<GLSwapChain*>(sch);
+        if (sc && sc->swapChain) {
+            int const err = mPlatform.setFrameRate(sc->swapChain, frameRate, compatibility, strategy);
+            if (err < 0) {
+                LOG(WARNING) << "Platform::setFrameRate returned an error: " << err;
+            }
+        }
     }
 }
 
@@ -2656,7 +2760,9 @@ FenceStatus OpenGLDriver::fenceWait(FenceHandle fh, uint64_t const timeout) {
     using namespace std::chrono;
     auto const now = steady_clock::now();
     steady_clock::time_point until = steady_clock::time_point::max();
-    if (now <= steady_clock::time_point::max() - nanoseconds(timeout)) {
+    if (timeout != FENCE_WAIT_FOR_EVER &&
+        timeout <= (uint64_t)nanoseconds::max().count() &&
+        now <= steady_clock::time_point::max() - nanoseconds(timeout)) {
         until = now + nanoseconds(timeout);
     }
 
@@ -2944,6 +3050,7 @@ bool OpenGLDriver::isProtectedContentSupported() {
     return mPlatform.isProtectedContextSupported();
 }
 
+
 bool OpenGLDriver::isStereoSupported() {
     // Instanced-stereo requires instancing and EXT_clip_cull_distance.
     // Multiview-stereo requires ES 3.0 and OVR_multiview2.
@@ -2969,7 +3076,9 @@ bool OpenGLDriver::isParallelShaderCompileSupported() {
     // GL-specific. It would also be nice to inform the engine that they're working with this fake
     // amortized system, but this fact will become implicit when we generalize this feature for all
     // backends.
-    if (getDriverConfig().disableAmortizedShaderCompile) {
+    auto featureFlagManager = getDriverConfig().featureFlagManager;
+    if (featureFlagManager &&
+            featureFlagManager->features.backend.disable_amortized_shader_compile) {
         return mShaderCompilerService.isParallelShaderCompileSupported();
     }
     return true;
@@ -3011,6 +3120,8 @@ bool OpenGLDriver::isWorkaroundNeeded(Workaround const workaround) {
             return mContext.bugs.disable_depth_precache_for_default_material;
         case Workaround::EMULATE_SRGB_SWAPCHAIN:
             return mContext.isES2() && !mPlatform.isSRGBSwapChainSupported();
+        case Workaround::DISABLE_MATERIAL_INSTANCE_UNIFORM_BATCHING:
+            return mContext.bugs.disable_material_instance_uniform_batching;
         default:
             return false;
     }
@@ -3205,16 +3316,12 @@ void OpenGLDriver::setVertexBufferObject(Handle<HwVertexBuffer> vbh,
 
 void OpenGLDriver::setVertexBufferObjectAsyncR(AsyncCallId jobId, Handle<HwVertexBuffer> vbh,
         uint32_t const index, Handle<HwBufferObject> boh, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
-    getJobQueue()->push([this, vbh, index, boh, handler, callback, user]() mutable {
-        DEBUG_MARKER_NAME("setVertexBufferObjectAsyncR")
-        setVertexBufferObjectCommon(vbh, index, boh);
-        // glFlush() should be called when using a shared context for this operation. Without it,
-        // the driver may delay submitting commands to the GPU, preventing other contexts from
-        // seeing the changes immediately. This ensures submitting the current commands right away.
-        glFlush();
-        scheduleCallback(handler, user, callback);
-    }, jobId);
+        AsyncCallback const callback, void* user) {
+    DEBUG_MARKER()
+
+    // No GL command to issue, only a buffer name and a version to set, which the draws read.
+    runAsyncCallNow(getJobQueue(), jobId, handler, callback, user,
+            [&] { setVertexBufferObjectCommon(vbh, index, boh); });
 }
 
 void OpenGLDriver::updateIndexBufferCommon(OpenGLState& gl, Handle<HwIndexBuffer> ibh, BufferDescriptor&& p,
@@ -3239,16 +3346,18 @@ void OpenGLDriver::updateIndexBuffer(
 
 void OpenGLDriver::updateIndexBufferAsyncR(AsyncCallId jobId, Handle<HwIndexBuffer> ibh,
         BufferDescriptor&& p, uint32_t const byteOffset, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
-    getJobQueue()->push([this, ibh, p=std::move(p), byteOffset, handler, callback,
-            user]() mutable {
+        AsyncCallback const callback, void* user) {
+    promoteToAsync(handle_cast<GLIndexBuffer*>(ibh));
+
+    getJobQueue()->push([this, ibh, p=std::move(p), byteOffset,
+            completion = AsyncCompletion(this, handler, callback, user)]() mutable {
         DEBUG_MARKER_NAME("updateIndexBufferAsyncR")
         updateIndexBufferCommon(getWorkerState(), ibh, std::move(p), byteOffset);
         // glFlush() should be called when using a shared context for this operation. Without it,
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        completion.schedule(AsyncCallStatus::COMPLETED);
     }, jobId);
 }
 
@@ -3292,16 +3401,18 @@ void OpenGLDriver::updateBufferObject(
 
 void OpenGLDriver::updateBufferObjectAsyncR(AsyncCallId jobId, Handle<HwBufferObject> boh,
         BufferDescriptor&& bd, uint32_t const byteOffset, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
-    getJobQueue()->push([this, boh, bd=std::move(bd), byteOffset, handler, callback,
-            user]() mutable {
+        AsyncCallback const callback, void* user) {
+    promoteToAsync(handle_cast<GLBufferObject*>(boh));
+
+    getJobQueue()->push([this, boh, bd=std::move(bd), byteOffset,
+            completion = AsyncCompletion(this, handler, callback, user)]() mutable {
         DEBUG_MARKER_NAME("updateBufferObjectAsyncR")
         updateBufferObjectCommon(getWorkerState(), boh, std::move(bd), byteOffset);
         // glFlush() should be called when using a shared context for this operation. Without it,
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        completion.schedule(AsyncCallStatus::COMPLETED);
     }, jobId);
 }
 
@@ -3395,9 +3506,12 @@ void OpenGLDriver::update3DImageAsyncR(AsyncCallId jobId, Handle<HwTexture> th,
         uint32_t const level, uint32_t const xoffset, uint32_t const yoffset, uint32_t const zoffset,
         uint32_t const width, uint32_t const height, uint32_t const depth,
         PixelBufferDescriptor&& data, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
+        AsyncCallback const callback, void* user) {
+    promoteToAsync(handle_cast<GLTexture*>(th));
+
     getJobQueue()->push([this, th, level, xoffset, yoffset, zoffset, width, height, depth,
-            data=std::move(data), handler, callback, user]() mutable {
+            data=std::move(data),
+            completion = AsyncCompletion(this, handler, callback, user)]() mutable {
         DEBUG_MARKER_NAME("update3DImageAsync")
         update3DImageCommon(getWorkerState(), th, level, xoffset, yoffset, zoffset, width, height, depth,
                 std::move(data));
@@ -3405,7 +3519,7 @@ void OpenGLDriver::update3DImageAsyncR(AsyncCallId jobId, Handle<HwTexture> th,
         // the driver may delay submitting commands to the GPU, preventing other contexts from
         // seeing the changes immediately. This ensures submitting the current commands right away.
         glFlush();
-        scheduleCallback(handler, user, callback);
+        completion.schedule(AsyncCallStatus::COMPLETED);
     }, jobId);
 }
 
@@ -3814,7 +3928,7 @@ void OpenGLDriver::beginRenderPass(Handle<HwRenderTarget> rth,
             // It's important to clear the framebuffer before drawing, as it resets
             // the fb to a known state (resets fb compression and possibly other things).
             // So we use glClear instead of glInvalidateFramebuffer
-            clearWithRasterPipe(discardOnlyFlags, { 0.0f }, 0.0f, 0);
+            clearWithRasterPipe(discardOnlyFlags, math::double4{ 0.0, 0.0, 0.0, 0.0 }, 0.0f, 0);
         }
     }
 
@@ -3836,7 +3950,7 @@ void OpenGLDriver::beginRenderPass(Handle<HwRenderTarget> rth,
 
 #ifndef NDEBUG
     // clear the discarded (but not the cleared ones) buffers in debug builds
-    clearWithRasterPipe(discardOnlyFlags, { 1, 0, 0, 1 }, 1.0, 0);
+    clearWithRasterPipe(discardOnlyFlags, math::double4{ 1.0, 0.0, 0.0, 1.0 }, 1.0, 0);
 #endif
 }
 
@@ -3893,7 +4007,7 @@ void OpenGLDriver::endRenderPass(int) {
     getBackendState().bindFramebuffer(GL_FRAMEBUFFER, rt->gl.fbo);
     getBackendState().disable(GL_SCISSOR_TEST);
     clearWithRasterPipe(discardFlags,
-            { 0, 1, 0, 1 }, 1.0, 0);
+            math::double4{ 0.0, 1.0, 0.0, 1.0 }, 1.0, 0);
 #endif
 
     mRenderPassTarget.clear();
@@ -4507,7 +4621,7 @@ void OpenGLDriver::finish(int) {
 
 UTILS_NOINLINE
 void OpenGLDriver::clearWithRasterPipe(TargetBufferFlags const clearFlags,
-        float4 const& linearColor, GLfloat const depth, GLint const stencil) noexcept {
+        ClearColorValue const& clearColor, GLfloat const depth, GLint const stencil) noexcept {
 
     if (any(clearFlags & TargetBufferFlags::COLOR_ALL)) {
         getBackendState().colorMask(GL_TRUE);
@@ -4521,30 +4635,52 @@ void OpenGLDriver::clearWithRasterPipe(TargetBufferFlags const clearFlags,
 
 #ifndef FILAMENT_SILENCE_NOT_SUPPORTED_BY_ES2
     if (UTILS_LIKELY(!mContext.isES2())) {
-        if (any(clearFlags & TargetBufferFlags::COLOR0)) {
-            glClearBufferfv(GL_COLOR, 0, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR1)) {
-            glClearBufferfv(GL_COLOR, 1, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR2)) {
-            glClearBufferfv(GL_COLOR, 2, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR3)) {
-            glClearBufferfv(GL_COLOR, 3, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR4)) {
-            glClearBufferfv(GL_COLOR, 4, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR5)) {
-            glClearBufferfv(GL_COLOR, 5, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR6)) {
-            glClearBufferfv(GL_COLOR, 6, linearColor.v);
-        }
-        if (any(clearFlags & TargetBufferFlags::COLOR7)) {
-            glClearBufferfv(GL_COLOR, 7, linearColor.v);
-        }
+        GLRenderTarget const* rt = handle_cast<GLRenderTarget*>(mRenderPassTarget);
+        auto clearColorBuffer = [&](int i, TargetBufferFlags flag) {
+            if (!any(clearFlags & flag)) {
+                return;
+            }
+            // Dispatch by the kind cached on the render target at attachment-set time. Calling
+            // the wrong glClearBuffer*v variant on an integer attachment is undefined in GL.
+            switch (rt->gl.colorClearKind[i]) {
+                case ColorClearKind::Float: {
+                    GLfloat const v[4] = {
+                            static_cast<GLfloat>(clearColor[0]),
+                            static_cast<GLfloat>(clearColor[1]),
+                            static_cast<GLfloat>(clearColor[2]),
+                            static_cast<GLfloat>(clearColor[3]) };
+                    glClearBufferfv(GL_COLOR, i, v);
+                    break;
+                }
+                case ColorClearKind::SignedInt: {
+                    GLint const v[4] = {
+                            static_cast<GLint>(clearColor[0]),
+                            static_cast<GLint>(clearColor[1]),
+                            static_cast<GLint>(clearColor[2]),
+                            static_cast<GLint>(clearColor[3]) };
+                    glClearBufferiv(GL_COLOR, i, v);
+                    break;
+                }
+                case ColorClearKind::UnsignedInt: {
+                    GLuint const v[4] = {
+                            static_cast<GLuint>(clearColor[0]),
+                            static_cast<GLuint>(clearColor[1]),
+                            static_cast<GLuint>(clearColor[2]),
+                            static_cast<GLuint>(clearColor[3]) };
+                    glClearBufferuiv(GL_COLOR, i, v);
+                    break;
+                }
+            }
+        };
+        clearColorBuffer(0, TargetBufferFlags::COLOR0);
+        clearColorBuffer(1, TargetBufferFlags::COLOR1);
+        clearColorBuffer(2, TargetBufferFlags::COLOR2);
+        clearColorBuffer(3, TargetBufferFlags::COLOR3);
+        clearColorBuffer(4, TargetBufferFlags::COLOR4);
+        clearColorBuffer(5, TargetBufferFlags::COLOR5);
+        clearColorBuffer(6, TargetBufferFlags::COLOR6);
+        clearColorBuffer(7, TargetBufferFlags::COLOR7);
+
         if ((clearFlags & TargetBufferFlags::DEPTH_AND_STENCIL) == TargetBufferFlags::DEPTH_AND_STENCIL) {
             glClearBufferfi(GL_DEPTH_STENCIL, 0, depth, stencil);
         } else {
@@ -4558,9 +4694,14 @@ void OpenGLDriver::clearWithRasterPipe(TargetBufferFlags const clearFlags,
     } else
 #endif
     {
+        // ES2 has no integer-format color attachments, so a float clear is always correct here.
         GLbitfield mask = 0;
         if (any(clearFlags & TargetBufferFlags::COLOR0)) {
-            glClearColor(linearColor.r, linearColor.g, linearColor.b, linearColor.a);
+            glClearColor(
+                    static_cast<float>(clearColor[0]),
+                    static_cast<float>(clearColor[1]),
+                    static_cast<float>(clearColor[2]),
+                    static_cast<float>(clearColor[3]));
             mask |= GL_COLOR_BUFFER_BIT;
         }
         if (any(clearFlags & TargetBufferFlags::DEPTH)) {
@@ -4916,9 +5057,47 @@ void OpenGLDriver::draw2(uint32_t const indexOffset, uint32_t const indexCount, 
 
 #ifndef FILAMENT_SILENCE_NOT_SUPPORTED_BY_ES2
     GLRenderPrimitive const* const rp = mBoundRenderPrimitive;
+    if (UTILS_UNLIKELY(!rp)) {
+        return;
+    }
     glDrawElementsInstanced(GLenum(rp->type), GLsizei(indexCount),
             rp->gl.getIndicesType(),
             reinterpret_cast<const void*>(indexOffset << rp->gl.indicesShift),
+            GLsizei(instanceCount));
+#endif
+
+#if FILAMENT_ENABLE_MATDBG
+    CHECK_GL_ERROR_NON_FATAL()
+#else
+    CHECK_GL_ERROR()
+#endif
+}
+
+void OpenGLDriver::drawArrays(uint32_t const vertexOffset, uint32_t const vertexCount,
+        uint32_t const instanceCount) {
+    DEBUG_MARKER()
+    // Attribute-less rendering depends on gl_VertexID, which is unavailable on GLES2 /
+    // FEATURE_LEVEL_0. The frontend (VertexBuffer::Builder::build) rejects attribute-less
+    // VertexBuffers at FEATURE_LEVEL_0, so this path should never execute on ES2.
+    assert_invariant(!mContext.isES2());
+    assert_invariant(mBoundRenderPrimitive);
+#if FILAMENT_ENABLE_MATDBG
+    if (UTILS_UNLIKELY(!mValidProgram)) {
+        return;
+    }
+#endif
+    assert_invariant(mBoundProgram);
+    assert_invariant(mValidProgram);
+
+    auto const invalidDescriptorSets =
+            mInvalidDescriptorSetBindings | mInvalidDescriptorSetBindingOffsets;
+    if (UTILS_UNLIKELY(invalidDescriptorSets.any())) {
+        updateDescriptors(invalidDescriptorSets);
+    }
+
+#ifndef FILAMENT_SILENCE_NOT_SUPPORTED_BY_ES2
+    GLRenderPrimitive const* const rp = mBoundRenderPrimitive;
+    glDrawArraysInstanced(GLenum(rp->type), GLint(vertexOffset), GLsizei(vertexCount),
             GLsizei(instanceCount));
 #endif
 
@@ -5014,14 +5193,16 @@ void OpenGLDriver::dispatchCompute(Handle<HwProgram> program, uint3 const workGr
 }
 
 void OpenGLDriver::queueCommandAsyncR(AsyncCallId jobId, Invocable<void()>&& command, CallbackHandler* handler,
-        CallbackHandler::Callback const callback, void* user) {
+        AsyncCallback const callback, void* user) {
     assert_invariant(getJobQueue());
-    getJobQueue()->push([this, command=std::move(command), handler, callback, user]() {
+    getJobQueue()->push([this, command=std::move(command),
+            completion = AsyncCompletion(this, handler, callback, user)]() mutable {
+        (void)this; // only used by DEBUG_MARKER_NAME, which is compiled out by default
         DEBUG_MARKER_NAME("queueCommandAsync")
         if (command) {
             command();
         }
-        scheduleCallback(handler, user, callback);
+        completion.schedule(AsyncCallStatus::COMPLETED);
     }, jobId);
 }
 

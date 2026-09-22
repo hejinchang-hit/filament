@@ -189,6 +189,13 @@ DECL_DRIVER_API_TAGGED_R_N(backend::VertexBufferHandle, createVertexBuffer,
         uint32_t, vertexCount,
         backend::VertexBufferInfoHandle, vbih)
 
+DECL_DRIVER_API_TAGGED_R_N(backend::VertexBufferHandle, createVertexBufferAsync,
+        uint32_t, vertexCount,
+        backend::VertexBufferInfoHandle, vbih,
+        backend::CallbackHandler*, handler,
+        backend::AsyncCallback, callback,
+        void*, user)
+
 DECL_DRIVER_API_TAGGED_R_N(backend::IndexBufferHandle, createIndexBuffer,
         backend::ElementType, elementType,
         uint32_t, indexCount,
@@ -199,7 +206,7 @@ DECL_DRIVER_API_TAGGED_R_N(backend::IndexBufferHandle, createIndexBufferAsync,
         uint32_t, indexCount,
         backend::BufferUsage, usage,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_TAGGED_R_N(backend::BufferObjectHandle, createBufferObject,
@@ -212,7 +219,7 @@ DECL_DRIVER_API_TAGGED_R_N(backend::BufferObjectHandle, createBufferObjectAsync,
         backend::BufferObjectBinding, bindingType,
         backend::BufferUsage, usage,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_TAGGED_R_N(backend::TextureHandle, createTexture,
@@ -235,7 +242,7 @@ DECL_DRIVER_API_TAGGED_R_N(backend::TextureHandle, createTextureAsync,
         uint32_t, depth,
         backend::TextureUsage, usage,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_TAGGED_R_N(backend::TextureHandle, createTextureView,
@@ -257,7 +264,7 @@ DECL_DRIVER_API_TAGGED_R_N(backend::TextureHandle, createTextureViewSwizzleAsync
         backend::TextureSwizzle, b,
         backend::TextureSwizzle, a,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_TAGGED_R_N(backend::TextureHandle, createTextureExternalImage2,
@@ -306,7 +313,7 @@ DECL_DRIVER_API_TAGGED_R_N(backend::TextureHandle, importTextureAsync,
         uint32_t, depth,
         backend::TextureUsage, usage,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_TAGGED_R_N(backend::RenderPrimitiveHandle, createRenderPrimitive,
@@ -444,7 +451,7 @@ DECL_DRIVER_API_R_N(backend::AsyncCallId, setVertexBufferObjectAsync,
         uint32_t, index,
         backend::BufferObjectHandle, bufferObject,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_N(updateIndexBuffer,
@@ -457,7 +464,7 @@ DECL_DRIVER_API_R_N(backend::AsyncCallId, updateIndexBufferAsync,
         backend::BufferDescriptor&&, data,
         uint32_t, byteOffset,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_N(updateBufferObject,
@@ -470,7 +477,7 @@ DECL_DRIVER_API_R_N(backend::AsyncCallId, updateBufferObjectAsync,
         backend::BufferDescriptor&&, data,
         uint32_t, byteOffset,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_N(updateBufferObjectUnsynchronized,
@@ -503,7 +510,7 @@ DECL_DRIVER_API_R_N(backend::AsyncCallId, update3DImageAsync,
         uint32_t, depth,
         backend::PixelBufferDescriptor&&, data,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_N(generateMipmaps,
@@ -587,6 +594,12 @@ DECL_DRIVER_API_N(makeCurrent,
 DECL_DRIVER_API_N(commit,
         backend::SwapChainHandle, sch)
 
+DECL_DRIVER_API_N(setFrameRate,
+        backend::SwapChainHandle, sch,
+        float, frameRate,
+        backend::Platform::FrameRateCompatibility, compatibility,
+        backend::Platform::ChangeFrameRateStrategy, changeFrameRateStrategy)
+
 /*
  * Setting rendering state
  * -----------------------
@@ -667,6 +680,14 @@ DECL_DRIVER_API_N(draw2,
         uint32_t, indexCount,
         uint32_t, instanceCount)
 
+// Non-indexed draw. Used for attribute-less / procedural rendering where the GPU generates
+// vertex data from gl_VertexID / gl_VertexIndex / [[vertex_id]]. The currently bound render
+// primitive must have been created without an IndexBuffer.
+DECL_DRIVER_API_N(drawArrays,
+        uint32_t, vertexOffset,
+        uint32_t, vertexCount,
+        uint32_t, instanceCount)
+
 DECL_DRIVER_API_N(draw,
         backend::PipelineState, state,
         backend::RenderPrimitiveHandle, rph,
@@ -690,7 +711,7 @@ DECL_DRIVER_API_N(scissor,
 DECL_DRIVER_API_R_N(backend::AsyncCallId, queueCommandAsync,
         utils::Invocable<void(void)>&&, command,
         backend::CallbackHandler*, handler,
-        backend::CallbackHandler::Callback, callback,
+        backend::AsyncCallback, callback,
         void*, user)
 
 DECL_DRIVER_API_SYNCHRONOUS_N(bool, cancelAsyncJob, backend::AsyncCallId, jobId)

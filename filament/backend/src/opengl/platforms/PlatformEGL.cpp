@@ -14,34 +14,32 @@
  * limitations under the License.
  */
 
-#include <backend/platforms/PlatformEGL.h>
-
 #include "opengl/GLUtils.h"
 
-#include <backend/platforms/OpenGLPlatform.h>
-
-#include <backend/Platform.h>
 #include <backend/DriverEnums.h>
+#include <backend/Platform.h>
+#include <backend/platforms/OpenGLPlatform.h>
+#include <backend/platforms/PlatformEGL.h>
+
+#include <utils/compiler.h>
+#include <utils/debug.h>
+#include <utils/Invocable.h>
+#include <utils/Logger.h>
+#include <utils/ostream.h>
+#include <utils/Panic.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <EGL/eglplatform.h>
 
+#include <algorithm>
+#include <initializer_list>
+#include <new>
+#include <utility>
+
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
-#include <utils/compiler.h>
-
-#include <utils/Invocable.h>
-#include <utils/Logger.h>
-#include <utils/Panic.h>
-#include <utils/debug.h>
-#include <utils/ostream.h>
-
-#include <algorithm>
-#include <new>
-#include <initializer_list>
-#include <utility>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -374,21 +372,33 @@ bool PlatformEGL::isProtectedContextSupported() const noexcept {
 }
 
 void PlatformEGL::createContext(bool const shared) {
+    // The current rendering API is thread-local and defaults to EGL_OPENGL_ES_API. A desktop GL
+    // context can't be created (nor shared) until this thread binds EGL_OPENGL_API, otherwise
+    // eglCreateContext fails with EGL_BAD_MATCH.
+    EGLenum const api = isOpenGL() ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
+    if (UTILS_UNLIKELY(eglBindAPI(api) == EGL_FALSE)) {
+        logEglError("eglBindAPI");
+        return;
+    }
+
     EGLConfig const config = ext.egl.KHR_no_config_context ? EGL_NO_CONFIG_KHR : mEGLConfig;
 
     EGLContext const context = eglCreateContext(mEGLDisplay, config,
             shared ? mEGLContext : EGL_NO_CONTEXT, mContextAttribs.data());
 
     if (UTILS_UNLIKELY(context == EGL_NO_CONTEXT)) {
-        // eglCreateContext failed
+        // eglCreateContext failed. Don't make EGL_NO_CONTEXT current, the caller would then run
+        // without a context at all, which goes unnoticed in release builds.
         logEglError("eglCreateContext");
+        return;
     }
-
-    assert_invariant(context != EGL_NO_CONTEXT);
 
     eglMakeCurrent(mEGLDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, context);
 
-    mAdditionalContexts.push_back(context);
+    {
+        utils::LockGuard const lock(mAdditionalContextsLock);
+        mAdditionalContexts.push_back(context);
+    }
 }
 
 void PlatformEGL::releaseContext() noexcept {
@@ -398,11 +408,14 @@ void PlatformEGL::releaseContext() noexcept {
         eglDestroyContext(mEGLDisplay, context);
     }
 
-    mAdditionalContexts.erase(
-            std::remove_if(mAdditionalContexts.begin(), mAdditionalContexts.end(),
-                    [context](EGLContext const c) {
-                        return c == context;
-                    }), mAdditionalContexts.end());
+    {
+        utils::LockGuard const lock(mAdditionalContextsLock);
+        mAdditionalContexts.erase(
+                std::remove_if(mAdditionalContexts.begin(), mAdditionalContexts.end(),
+                        [context](EGLContext const c) {
+                            return c == context;
+                        }), mAdditionalContexts.end());
+    }
 
     eglReleaseThread();
 }
@@ -417,7 +430,12 @@ void PlatformEGL::terminate() noexcept {
     if (mEGLContextProtected != EGL_NO_CONTEXT) {
         eglDestroyContext(mEGLDisplay, mEGLContextProtected);
     }
-    for (auto const context : mAdditionalContexts) {
+    std::vector<EGLContext> additionalContexts;
+    {
+        utils::LockGuard const lock(mAdditionalContextsLock);
+        additionalContexts.swap(mAdditionalContexts);
+    }
+    for (auto const context : additionalContexts) {
         eglDestroyContext(mEGLDisplay, context);
     }
     eglTerminate(mEGLDisplay);
@@ -721,6 +739,7 @@ void PlatformEGL::initializeGlExtensions() noexcept {
     if (extensions) {
         GLUtils::unordered_string_set const glExtensions = GLUtils::split(extensions);
         ext.gl.OES_EGL_image_external_essl3 = glExtensions.has("GL_OES_EGL_image_external_essl3");
+        ext.gl.EXT_EGL_image_storage = glExtensions.has("GL_EXT_EGL_image_storage");
     }
 }
 

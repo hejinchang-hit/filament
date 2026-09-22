@@ -17,16 +17,17 @@
 #ifndef TNT_FILAMENT_BACKEND_VULKANCOMMANDS_H
 #define TNT_FILAMENT_BACKEND_VULKANCOMMANDS_H
 
-#include <bluevk/BlueVK.h>
-
 #include "DriverBase.h"
-
 #include "VulkanAsyncHandles.h"
 #include "VulkanConstants.h"
 #include "VulkanContext.h"
+#include "VulkanFencePool.h"
 #include "VulkanSemaphoreManager.h"
+
 #include "vulkan/memory/ResourcePointer.h"
 #include "vulkan/utils/StaticVector.h"
+
+#include <bluevk/BlueVK.h>
 
 #include <utils/Condition.h>
 #include <utils/CString.h>
@@ -44,7 +45,6 @@ namespace filament::backend {
 
 using namespace fvkmemory;
 
-#if FVK_ENABLED(FVK_DEBUG_GROUP_MARKERS)
 class VulkanGroupMarkers {
 public:
     using Timestamp = std::chrono::time_point<std::chrono::high_resolution_clock>;
@@ -59,19 +59,15 @@ private:
     std::list<std::pair<utils::CString, Timestamp>> mMarkers;
 };
 
-#endif // FVK_DEBUG_GROUP_MARKERS
-
 // The submission fence has shared ownership semantics because it is potentially wrapped by a
 // DriverApi fence object and should not be destroyed until both the DriverApi object is freed and
 // we're done waiting on the most recent submission of the given command buffer.
 struct VulkanCommandBuffer {
-    VulkanCommandBuffer(VulkanContext const& mContext, VkDevice device, VkQueue queue,
+    VulkanCommandBuffer(VulkanContext const& context, VulkanFencePool& fencePool, VkDevice device, VkQueue queue,
             VkCommandPool pool, VulkanSemaphoreManager* semaphoreManager, bool isProtected);
 
     VulkanCommandBuffer(VulkanCommandBuffer const&) = delete;
     VulkanCommandBuffer& operator=(VulkanCommandBuffer const&) = delete;
-
-    ~VulkanCommandBuffer();
 
     template <typename T,
               typename = std::enable_if_t<
@@ -95,8 +91,8 @@ struct VulkanCommandBuffer {
     void begin() noexcept;
     fvkmemory::resource_ptr<VulkanSemaphore> submit();
 
-    inline void setComplete() {
-        mFenceStatus->setStatus(VK_SUCCESS);
+    inline void refreshStatus(VkDevice device) {
+        mFenceStatus->refreshStatus(device);
     }
 
     VkResult getStatus() {
@@ -108,7 +104,7 @@ struct VulkanCommandBuffer {
     }
 
     VkFence getVkFence() const {
-        return mFence;
+        return mFenceStatus->getVkFence();
     }
 
     VkCommandBuffer buffer() const {
@@ -126,16 +122,15 @@ private:
     static uint32_t sAgeCounter;
 
     VulkanContext const& mContext;
+    VulkanFencePool& mFencePool;
     uint8_t mMarkerCount;
     bool const isProtected;
-    VkDevice mDevice;
     VkQueue mQueue;
     VulkanSemaphoreManager* mSemaphoreManager;
     fvkutils::StaticVector<VkSemaphore, 2> mWaitSemaphores;
     fvkutils::StaticVector<VkPipelineStageFlags, 2> mWaitSemaphoreStages;
     VkCommandBuffer mBuffer;
     fvkmemory::resource_ptr<VulkanSemaphore> mSubmission;
-    VkFence mFence;
     std::shared_ptr<VulkanCmdFence> mFenceStatus;
     std::vector<HeldResource> mResources;
     uint32_t mAge;
@@ -157,12 +152,10 @@ struct CommandBufferPool {
     void wait();
     void waitFor(VkSemaphore previousAction, VkPipelineStageFlags waitStage);
 
-#if FVK_ENABLED(FVK_DEBUG_GROUP_MARKERS)
     utils::CString topMarker() const;
     void pushMarker(char const* marker, VulkanGroupMarkers::Timestamp timestamp);
     std::pair<utils::CString, VulkanGroupMarkers::Timestamp> popMarker();
     void insertEvent(char const* marker);
-#endif
 
     inline bool isRecording() const { return mRecording != INVALID; }
 
@@ -181,10 +174,9 @@ private:
     ActiveBuffers mSubmitted;
     std::vector<std::unique_ptr<VulkanCommandBuffer>> mBuffers;
     int8_t mRecording;
+    VulkanFencePool mFencePool;
 
-#if FVK_ENABLED(FVK_DEBUG_GROUP_MARKERS)
     std::unique_ptr<VulkanGroupMarkers> mGroupMarkers;
-#endif
 };
 
 // Manages a set of command buffers and semaphores, exposing an API that is significantly simpler
@@ -238,10 +230,6 @@ public:
         return sem;
     }
 
-    VkFence getMostRecentFence() {
-        return mLastFence;
-    }
-
     std::shared_ptr<VulkanCmdFence> getMostRecentFenceStatus() {
         return mLastFenceStatus;
     }
@@ -263,12 +251,10 @@ public:
     // Updates the atomic "status" variable in every extant fence.
     void updateFences();
 
-#if FVK_ENABLED(FVK_DEBUG_GROUP_MARKERS)
     void pushGroupMarker(char const* str, VulkanGroupMarkers::Timestamp timestamp = {});
     void popGroupMarker();
     void insertEventMarker(char const* string, uint32_t len);
     utils::CString getTopGroupMarker() const;
-#endif
 
 private:
     VkDevice const mDevice;
@@ -284,7 +270,6 @@ private:
     VkSemaphore mInjectedDependency = VK_NULL_HANDLE;
     fvkmemory::resource_ptr<VulkanSemaphore> mLastSubmit;
 
-    VkFence mLastFence = VK_NULL_HANDLE;
     // Start out with a completed fence, because if no commands have
     // been queued or submited, then by definition, all pending work
     // is complete.

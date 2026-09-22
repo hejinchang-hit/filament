@@ -15,11 +15,15 @@
  */
 
 #include "details/IndexBuffer.h"
+
+#include "FilamentAPI-impl.h"
+
 #include "details/AsyncHelpers.h"
 #include "details/Engine.h"
 
-#include "FilamentAPI-impl.h"
-#include "filament/FilamentAPI.h"
+#include <filament/FilamentAPI.h>
+
+#include <private/backend/Driver.h>
 
 #include <backend/DriverEnums.h>
 
@@ -29,8 +33,8 @@
 
 #include <utility>
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 namespace filament {
 
@@ -69,6 +73,10 @@ IndexBuffer::Builder& IndexBuffer::Builder::name(utils::StaticString const& name
     return BuilderNameMixin::name(name);
 }
 
+IndexBuffer::Builder& IndexBuffer::Builder::name(utils::ImmutableCString const& name) noexcept {
+    return BuilderNameMixin::name(name);
+}
+
 IndexBuffer::Builder& IndexBuffer::Builder::async(backend::CallbackHandler* handler,
         AsyncCompletionCallback callback, void* user) noexcept {
     mImpl->mAsynchronous = true;
@@ -96,6 +104,11 @@ FIndexBuffer::FIndexBuffer(FEngine& engine, const Builder& builder)
             builder->mIndexType == IndexType::UINT || builder->mIndexType == IndexType::USHORT)
             << "Invalid index type " << static_cast<int>(builder->mIndexType) << ", tag=" << tag;
 
+    // Only set once the index type is known to be valid, so that getByteCount() never derives
+    // a capacity from an unsupported type.
+    mElementSize = uint8_t(backend::Driver::getElementTypeSize(
+            backend::ElementType(builder->mIndexType)));
+
     FEngine::DriverApi& driver = engine.getDriverApi();
 
     if (builder->mAsynchronous) {
@@ -110,10 +123,15 @@ FIndexBuffer::FIndexBuffer(FEngine& engine, const Builder& builder)
                 /* userCallback */ std::move(copiedCompletionCallback),
                 /* userParam1 */ this,
                 /* userParam2 */ builder->mAsyncCreationUserData,
-                /* onCountdownComplete */ [this]() {
+                /* onCountdownComplete */ [this](backend::AsyncCallStatus const status) {
+                    // Always leaves CREATING, even when canceled: FEngine::destroy waits on that
+                    // to free the object, so one that stays CREATING is deferred forever.
                     // `std::memory_order_relaxed` should be sufficient because no other variables
                     // need to be visible to other threads in a strict sequence.
-                    mCreationComplete.store(true, std::memory_order_relaxed);
+                    mCreationStatus.store(status == backend::AsyncCallStatus::CANCELED
+                                    ? CreationStatus::CANCELED
+                                    : CreationStatus::CREATED,
+                            std::memory_order_relaxed);
                 },
                 /* driver */ &engine.getDriver());
 
@@ -133,7 +151,7 @@ FIndexBuffer::FIndexBuffer(FEngine& engine, const Builder& builder)
         // In regular (non-asynchronous) mode, we know creation is complete as soon as all
         // creation-relevant API calls are recorded into the command stream, because subsequent API
         // calls will always be invoked after that (even including asynchronous version of APIs).
-        mCreationComplete.store(true, std::memory_order_relaxed);
+        mCreationStatus.store(CreationStatus::CREATED, std::memory_order_relaxed);
     }
 }
 
@@ -146,6 +164,18 @@ void FIndexBuffer::setBuffer(FEngine& engine, BufferDescriptor&& buffer, uint32_
 
     FILAMENT_CHECK_PRECONDITION((byteOffset & 0x3) == 0)
             << "byteOffset must be a multiple of 4";
+    FILAMENT_CHECK_PRECONDITION(buffer.buffer != nullptr)
+            << "buffer data cannot be null";
+    FILAMENT_CHECK_PRECONDITION(isCreationSuccessful())
+            << "IndexBuffer creation failed or is not complete";
+
+    // Written as two comparisons rather than `byteOffset + buffer.size <= capacity` so that a
+    // large byteOffset cannot wrap around and defeat the check.
+    size_t const capacity = getByteCount();
+    FILAMENT_CHECK_PRECONDITION(
+            buffer.size <= capacity && byteOffset <= capacity - buffer.size)
+            << "buffer overflow: byteOffset(" << byteOffset << ") + size(" << buffer.size
+            << ") > capacity(" << capacity << ")";
 
     engine.getDriverApi().updateIndexBuffer(mHandle, std::move(buffer), byteOffset);
 }
@@ -156,6 +186,14 @@ backend::AsyncCallId FIndexBuffer::setBufferAsync(FEngine& engine, BufferDescrip
 
     FILAMENT_CHECK_PRECONDITION((byteOffset & 0x3) == 0)
             << "byteOffset must be a multiple of 4";
+    FILAMENT_CHECK_PRECONDITION(buffer.buffer != nullptr)
+            << "buffer data cannot be null";
+
+    size_t const capacity = getByteCount();
+    FILAMENT_CHECK_PRECONDITION(
+            buffer.size <= capacity && byteOffset <= capacity - buffer.size)
+            << "buffer overflow: byteOffset(" << byteOffset << ") + size(" << buffer.size
+            << ") > capacity(" << capacity << ")";
 
     using IndexBufferCallbackAdapter = CallbackAdapter<IndexBuffer>;
     auto* const cbWrapper = IndexBufferCallbackAdapter::make(std::move(callback), this, user);

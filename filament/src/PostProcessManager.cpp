@@ -24,6 +24,30 @@
 
 #include "PostProcessManager.h"
 
+#include "FrameHistory.h"
+#include "fsr.h"
+#include "RenderPass.h"
+#include "ShadowMapManager.h"
+
+#include "details/Camera.h"
+#include "details/ColorGrading.h"
+#include "details/Engine.h"
+#include "details/Material.h"
+#include "details/MaterialInstance.h"
+#include "details/Texture.h"
+#include "details/VertexBuffer.h"
+
+#include "ds/DescriptorSet.h"
+#include "ds/SsrPassDescriptorSet.h"
+#include "ds/TypedUniformBuffer.h"
+
+#include "fg/FrameGraph.h"
+#include "fg/FrameGraphId.h"
+#include "fg/FrameGraphResources.h"
+#include "fg/FrameGraphTexture.h"
+
+#include "generated/resources/materials.h"
+
 #include "materials/antiAliasing/fxaa/fxaa.h"
 #include "materials/antiAliasing/taa/taa.h"
 #include "materials/bloom/bloom.h"
@@ -36,47 +60,28 @@
 #include "materials/sgsr/sgsr.h"
 #include "materials/ssao/ssao.h"
 
-#include "details/Engine.h"
-
-#include "ds/DescriptorSet.h"
-#include "ds/SsrPassDescriptorSet.h"
-#include "ds/TypedUniformBuffer.h"
-
-#include "fg/FrameGraph.h"
-#include "fg/FrameGraphId.h"
-#include "fg/FrameGraphResources.h"
-#include "fg/FrameGraphTexture.h"
-
-#include "fsr.h"
-#include "FrameHistory.h"
-#include "RenderPass.h"
-#include "ShadowMapManager.h"
-
-#include "details/Camera.h"
-#include "details/ColorGrading.h"
-#include "details/Material.h"
-#include "details/MaterialInstance.h"
-#include "details/Texture.h"
-#include "details/VertexBuffer.h"
-
-#include "generated/resources/materials.h"
+#include <private/filament/EngineEnums.h>
+#include <private/filament/UibStructs.h>
+#include <private/filament/Variant.h>
 
 #include <filament/Material.h>
 #include <filament/MaterialEnums.h>
 #include <filament/Options.h>
 #include <filament/Viewport.h>
 
-#include <private/filament/EngineEnums.h>
-#include <private/filament/UibStructs.h>
-#include <private/filament/Variant.h>
+#include <private/backend/BackendUtils.h>
 
-#include <backend/DriverEnums.h>
 #include <backend/DriverApiForward.h>
+#include <backend/DriverEnums.h>
 #include <backend/Handle.h>
 #include <backend/PipelineState.h>
 #include <backend/PixelBufferDescriptor.h>
 
-#include <private/backend/BackendUtils.h>
+#include <utils/algorithm.h>
+#include <utils/BitmaskEnum.h>
+#include <utils/compiler.h>
+#include <utils/debug.h>
+#include <utils/FixedCapacityVector.h>
 
 #include <math/half.h>
 #include <math/mat2.h>
@@ -87,12 +92,6 @@
 #include <math/vec3.h>
 #include <math/vec4.h>
 
-#include <utils/algorithm.h>
-#include <utils/BitmaskEnum.h>
-#include <utils/debug.h>
-#include <utils/compiler.h>
-#include <utils/FixedCapacityVector.h>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -100,8 +99,8 @@
 #include <limits>
 #include <string_view>
 #include <type_traits>
-#include <variant>
 #include <utility>
+#include <variant>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -250,14 +249,18 @@ void PostProcessManager::bindPerRenderableDescriptorSet(DriverApi& driver) const
 FMaterialInstance* PostProcessManager::getMaterialInstance(backend::DriverApi& driver,
         FMaterial const* ma, Variant::type_t variant) const {
     FMaterialInstance* mi = mMaterialInstanceManager.getMaterialInstance(ma);
-    mi->prepareProgram(driver, Variant{ variant }, backend::CompilerPriorityQueue::CRITICAL);
+    // TODO: Update this part when we have spec consts which affect post processing effects.
+    mi->prepareProgram(driver, Variant{ variant }, DynamicSpecConstKey{ 0 },
+            backend::CompilerPriorityQueue::CRITICAL);
     return mi;
 }
 
 FMaterialInstance* PostProcessManager::getMaterialInstanceWithTag(backend::DriverApi& driver,
         FMaterial const* ma, uint32_t tag, Variant::type_t variant) const {
     FMaterialInstance* mi = mMaterialInstanceManager.getMaterialInstance(ma, tag);
-    mi->prepareProgram(driver, Variant { variant }, backend::CompilerPriorityQueue::CRITICAL);
+    // TODO: Update this part when we have spec consts which affect post processing effects.
+    mi->prepareProgram(driver, Variant{ variant }, DynamicSpecConstKey{ 0 },
+            backend::CompilerPriorityQueue::CRITICAL);
     return mi;
 }
 
@@ -483,7 +486,8 @@ PipelineState PostProcessManager::getPipelineState(
         FMaterialInstance const* const mi, Variant::type_t const variant) const noexcept {
     FMaterial const* const ma = mi->getMaterial();
     return {
-            .program = mi->getProgram(Variant{ variant }),
+            // TODO: Update this part when we have spec consts which affect post processing effects.
+            .program = mi->getProgram(Variant{ variant }, DynamicSpecConstKey{0}),
             .vertexBufferInfo = mFullScreenQuadVbih,
             .pipelineLayout = {
                     .setLayout = {
@@ -631,6 +635,9 @@ PostProcessManager::StructurePassOutput PostProcessManager::structure(FrameGraph
 
     fg.addPass<StructureMipmapData>("StructureMipmap",
             [&](FrameGraph::Builder& builder, auto& data) {
+                if (levelCount > 1) {
+                    builder.reserveRenderTargets(levelCount - 1);
+                }
                 data.depth = builder.sample(depth);
                 for (size_t i = 1; i < levelCount; i++) {
                     auto out = builder.createSubresource(data.depth, "Structure mip", {
@@ -970,7 +977,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::screenSpaceAmbientOcclusion(
                         FrameGraphTexture::Usage::DEPTH_ATTACHMENT);
                 builder.declareRenderPass("SSAO Target", {
                         .attachments = { .color = { data.ao, data.bn }, .depth = depthAttachment },
-                        .clearColor = { 1.0f },
+                        .clearColor = ClearColorValue{ 1.0f, 1.0f, 1.0f, 1.0f },
                         .clearFlags = TargetBufferFlags::COLOR0 | TargetBufferFlags::COLOR1
                 });
             },
@@ -1170,7 +1177,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::bilateralBlurPass(FrameGraph
 
                 builder.declareRenderPass("Blurred target", {
                         .attachments = { .color = { data.ao, data.bn }, .depth = depth },
-                        .clearColor = { 1.0f },
+                        .clearColor = ClearColorValue{ 1.0f, 1.0f, 1.0f, 1.0f },
                         .clearFlags = TargetBufferFlags::COLOR0 | TargetBufferFlags::COLOR1
                 });
             },
@@ -1337,6 +1344,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::gaussianBlurPass(FrameGraph&
                 // note: we don't systematically use a Sampler2D for the temp buffer because
                 // this could force us to use two different programs below
 
+                builder.reserveRenderTargets(2);
                 data.in = builder.sample(input);
                 data.temp = builder.createTexture("Horizontal temporary buffer", tempDesc);
                 data.temp = builder.sample(data.temp);
@@ -1868,6 +1876,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::dof(FrameGraph& fg,
 
     auto const& ppDoFMipmap = fg.addPass<PostProcessDofMipmap>("DoF Mipmap",
             [&](FrameGraph::Builder& builder, auto& data) {
+                builder.reserveRenderTargets(mipmapCount - 1u);
                 data.inOutColor = builder.sample(ppDoFDownsample->outColor);
                 data.inOutCoc   = builder.sample(ppDoFDownsample->outCoc);
                 for (size_t i = 0; i < mipmapCount - 1u; i++) {
@@ -1899,7 +1908,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::dof(FrameGraph& fg,
 
                 auto const& material = getPostProcessMaterial("dofMipmap");
                 FMaterial const* const ma = material.getMaterial(mEngine);
-                FMaterialInstance* const mi = getMaterialInstance(driver, ma);
+                FMaterialInstance* const mi = getMaterialInstance(driver, ma, variant);
 
                 auto const pipeline = getPipelineState(mi, variant);
 
@@ -1910,7 +1919,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::dof(FrameGraph& fg,
                     auto inColor = driver.createTextureView(inOutColor, level, 1);
                     auto inCoc = driver.createTextureView(inOutCoc, level, 1);
                     // FIXME: is this necessary?
-                    FMaterialInstance* const mi = getMaterialInstance(driver, ma);
+                    FMaterialInstance* const mi = getMaterialInstance(driver, ma, variant);
 
                     mi->setParameter("color", inColor, SamplerParams{
                             .filterMin = SamplerMinFilter::NEAREST_MIPMAP_NEAREST });
@@ -2357,6 +2366,7 @@ PostProcessManager::BloomPassOutput PostProcessManager::bloom(FrameGraph& fg,
 
     auto const& bloomDownsamplePass = fg.addPass<BloomPassData>("Bloom Downsample",
             [&](FrameGraph::Builder& builder, auto& data) {
+                builder.reserveRenderTargets(inoutBloomOptions.levels);
                 data.out = builder.createTexture("Bloom Out Texture", {
                         .width = width,
                         .height = height,
@@ -2425,6 +2435,7 @@ PostProcessManager::BloomPassOutput PostProcessManager::bloom(FrameGraph& fg,
 
     auto const& bloomUpsamplePass = fg.addPass<BloomPassData>("Bloom Upsample",
             [&](FrameGraph::Builder& builder, auto& data) {
+                builder.reserveRenderTargets(inoutBloomOptions.levels);
                 data.out = builder.sample(input);
                 for (size_t i = 0; i < inoutBloomOptions.levels; i++) {
                     auto out = builder.createSubresource(data.out, "Bloom Out Texture mip",
@@ -2596,7 +2607,7 @@ void PostProcessManager::colorGradingSubpass(DriverApi& driver,
 void PostProcessManager::customResolvePrepareSubpass(DriverApi& driver, CustomResolveOp const op) noexcept {
     auto const& material = getPostProcessMaterial("customResolveAsSubpass");
     auto const ma = material.getMaterial(mEngine);
-    auto* const mi = getMaterialInstance(driver, ma, 0);
+    auto* const mi = getMaterialInstanceWithTag(driver, ma, 0, 0);
     mi->setParameter("direction", op == CustomResolveOp::COMPRESS ? 1.0f : -1.0f),
     mi->commit(driver, getUboManager());
 }
@@ -2608,7 +2619,7 @@ void PostProcessManager::customResolveSubpass(DriverApi& driver) noexcept {
     auto const& material = getPostProcessMaterial("customResolveAsSubpass");
     FMaterial const* const ma = material.getMaterial(mEngine);
     // the UBO has been set and committed in customResolvePrepareSubpass()
-    FMaterialInstance const* mi = getMaterialInstance(driver, ma, 0);
+    FMaterialInstance const* mi = getMaterialInstanceWithTag(driver, ma, 0, 0);
     mi->use(driver);
 
     auto const pipeline = getPipelineState(mi);
@@ -3095,7 +3106,7 @@ FrameGraphId<FrameGraphTexture> PostProcessManager::taa(FrameGraph& fg,
 
                 FMaterial const* const ma = material.getMaterial(mEngine);
 
-                FMaterialInstance* mi = getMaterialInstance(driver, ma);
+                FMaterialInstance* mi = getMaterialInstance(driver, ma, variant);
                 mi->setParameter("color",  color, SamplerParams{});  // nearest
                 mi->setParameter("depth",  depth, SamplerParams{});  // nearest
                 mi->setParameter("history", history, SamplerParams{

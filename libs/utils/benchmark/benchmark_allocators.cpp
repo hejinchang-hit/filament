@@ -35,10 +35,10 @@ protected:
 
     static_assert(sizeof(Payload) == 64, "Payload must be 64 bytes");
 
-    utils::Arena<utils::ObjectPoolAllocator<Payload>, LockingPolicy::NoLock> mPoolAllocatorNoLock;
-    utils::Arena<utils::ObjectPoolAllocator<Payload>, std::mutex> mPoolAllocatorStdMutex;
-    utils::Arena<utils::ObjectPoolAllocator<Payload>, utils::Mutex> mPoolAllocatorUtilsMutex;
-    utils::Arena<utils::ThreadSafeObjectPoolAllocator<Payload>, LockingPolicy::NoLock> mPoolAllocatorAtomic;
+    Arena<ObjectPoolAllocator<Payload>, LockingPolicy::NoLock> mPoolAllocatorNoLock;
+    Arena<ObjectPoolAllocator<Payload>, std::mutex> mPoolAllocatorStdMutex;
+    Arena<ObjectPoolAllocator<Payload>, Mutex> mPoolAllocatorUtilsMutex;
+    Arena<ThreadSafeObjectPoolAllocator<Payload>, LockingPolicy::NoLock> mPoolAllocatorAtomic;
 };
 
 static constexpr size_t POOL_ITEM_COUNT = 4096;
@@ -55,36 +55,36 @@ Allocators::~Allocators() = default;
 BENCHMARK_F(Allocators, poolAllocator_nolock)(benchmark::State& state) {
     auto& pool = mPoolAllocatorNoLock;
     PerformanceCounters pc(state);
-    for (auto _ : state) {
+    for (auto _ UTILS_UNUSED: state) {
         Payload* p = pool.alloc<Payload>(1);
-        pool.free(p);
+        pool.free(p, sizeof(Payload));
     }
 }
 
 BENCHMARK_DEFINE_F(Allocators, poolAllocator_std_mutex)(benchmark::State& state) {
     auto& pool = mPoolAllocatorStdMutex;
     PerformanceCounters pc(state);
-    for (auto _ : state) {
+    for (auto _ UTILS_UNUSED: state) {
         Payload* p = pool.alloc<Payload>(1);
-        pool.free(p);
+        pool.free(p, sizeof(Payload));
     }
 }
 
 BENCHMARK_DEFINE_F(Allocators, poolAllocator_utils_mutex)(benchmark::State& state) {
     auto& pool = mPoolAllocatorUtilsMutex;
     PerformanceCounters pc(state);
-    for (auto _ : state) {
+    for (auto _ UTILS_UNUSED: state) {
         Payload* p = pool.alloc<Payload>(1);
-        pool.free(p);
+        pool.free(p, sizeof(Payload));
     }
 }
 
 BENCHMARK_DEFINE_F(Allocators, poolAllocator_atomic)(benchmark::State& state) {
     auto& pool = mPoolAllocatorAtomic;
     PerformanceCounters pc(state);
-    for (auto _ : state) {
+    for (auto _ UTILS_UNUSED: state) {
         Payload* p = pool.alloc<Payload>(1);
-        pool.free(p);
+        pool.free(p, sizeof(Payload));
     }
 }
 

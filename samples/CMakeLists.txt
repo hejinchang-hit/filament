@@ -27,6 +27,8 @@ set(MATERIAL_SRCS
         materials/image.mat
         materials/mirror.mat
         materials/overdraw.mat
+        materials/proceduralEffect.mat
+        materials/proceduralTextureQuad.mat
         materials/sandboxCloth.mat
         materials/sandboxLit.mat
         materials/sandboxLitFade.mat
@@ -97,10 +99,10 @@ if (DEFINED RESGEN_SOURCE_FLAGS)
 endif()
 
 # CMake fails to invoke ar on Windows unless there is at least one C/C++ file in the library.
-set(DUMMY_SRC "${RESOURCE_DIR}/dummy.c")
-add_custom_command(OUTPUT ${DUMMY_SRC} COMMAND echo "//" > ${DUMMY_SRC})
+set(SAMPLE_DUMMY_SRC "${RESOURCE_DIR}/dummy_sample.c")
+add_custom_command(OUTPUT ${SAMPLE_DUMMY_SRC} COMMAND echo "//" > ${SAMPLE_DUMMY_SRC})
 
-add_library(sample-resources ${DUMMY_SRC} ${RESGEN_SOURCE})
+add_library(sample-resources ${SAMPLE_DUMMY_SRC} ${RESGEN_SOURCE})
 set_target_properties(sample-resources PROPERTIES FOLDER Samples/Resources)
 
 # ==================================================================================================
@@ -187,14 +189,20 @@ if (DEFINED RESGEN_SOURCE_FLAGS)
     set_source_files_properties(${RESGEN_SOURCE} PROPERTIES COMPILE_FLAGS ${RESGEN_SOURCE_FLAGS})
 endif()
 
-add_library(suzanne-resources ${DUMMY_SRC} ${RESGEN_SOURCE})
+set(SUZANNE_DUMMY_SRC "${RESOURCE_DIR}/dummy_suzanne.c")
+add_custom_command(OUTPUT ${SUZANNE_DUMMY_SRC} COMMAND echo "//" > ${SUZANNE_DUMMY_SRC})
+
+add_library(suzanne-resources ${SUZANNE_DUMMY_SRC} ${RESGEN_SOURCE})
 set_target_properties(suzanne-resources PROPERTIES FOLDER Samples/Resources)
 
 # ==================================================================================================
 # Resources for gltf_viewer and gltf_instances
 # ==================================================================================================
 
-add_library(gltf-demo-resources ${DUMMY_SRC})
+set(GLTF_DEMO_DUMMY_SRC "${RESOURCE_DIR}/dummy_gltf_demo.c")
+add_custom_command(OUTPUT ${GLTF_DEMO_DUMMY_SRC} COMMAND echo "//" > ${GLTF_DEMO_DUMMY_SRC})
+
+add_library(gltf-demo-resources ${GLTF_DEMO_DUMMY_SRC})
 set_target_properties(gltf-demo-resources PROPERTIES FOLDER Samples/Resources)
 
 set(GLTF_DEMO_RESOURCES
@@ -223,15 +231,24 @@ target_sources(gltf-demo-resources PRIVATE ${RESGEN_SOURCE})
 
 add_library(samples-common STATIC
     common/arguments.cpp
-    common/configuration.h
-    common/configuration.cpp
+    common/arguments.h
+    include/samples/Parameter.h
+    include/samples/SampleConfig.h
 )
 
-target_include_directories(samples-common PRIVATE
+target_include_directories(samples-common PUBLIC
+    include
 )
-target_link_libraries(samples-common filament)
+target_link_libraries(samples-common filament filamentapp)
 
 set_target_properties(samples-common PROPERTIES FOLDER Samples/Common)
+
+get_property(_isMultiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if (_isMultiConfig)
+    target_compile_definitions(samples-common PRIVATE RELATIVE_ASSET_PATH="..")
+else()
+    target_compile_definitions(samples-common PRIVATE RELATIVE_ASSET_PATH=".")
+endif()
 
 # ==================================================================================================
 # Compiler flags
@@ -248,10 +265,12 @@ endif()
 # Test apps
 # ==================================================================================================
 
+set_property(GLOBAL PROPERTY FILAMENT_SAMPLES_LIST "")
+
 function(add_demo NAME)
     include_directories(${GENERATION_ROOT})
     add_executable(${NAME} ${NAME}.cpp)
-    target_link_libraries(${NAME} PRIVATE sample-resources filamentapp samples-common)
+    target_link_libraries(${NAME} PRIVATE sample-resources samples-common)
     target_compile_options(${NAME} PRIVATE ${COMPILER_FLAGS})
     set_target_properties(${NAME} PROPERTIES FOLDER Samples)
 
@@ -260,10 +279,13 @@ function(add_demo NAME)
         set_target_properties(${NAME} PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE)
         set_target_properties(${NAME} PROPERTIES INSTALL_RPATH /usr/local/lib)
     endif()
+
+    set_property(GLOBAL APPEND PROPERTY FILAMENT_SAMPLES_LIST ${NAME})
 endfunction()
 
 if (NOT ANDROID)
     add_demo(animation)
+    add_demo(async_stream_bench)
     add_demo(depthtesting)
     add_demo(frame_generator)
     add_demo(gltf_viewer)
@@ -289,6 +311,8 @@ if (NOT ANDROID)
     if (NOT FILAMENT_SUPPORTS_WEBGPU)
         add_demo(point_sprites)
     endif ()
+    add_demo(procedural_effect)
+    add_demo(procedural_texture_quad)
     add_demo(rendertarget)
     add_demo(sample_cloth)
     add_demo(sample_full_pbr)
@@ -301,18 +325,22 @@ if (NOT ANDROID)
     add_demo(vbotest)
     add_demo(viewtest)
 
+    get_property(ALL_SAMPLES GLOBAL PROPERTY FILAMENT_SAMPLES_LIST)
+    add_custom_target(filament-samples DEPENDS ${ALL_SAMPLES})
+    set_target_properties(filament-samples PROPERTIES FOLDER Samples)
+
     # Sample app specific
-    target_link_libraries(frame_generator PRIVATE imageio)
+
     target_link_libraries(gltf_viewer PRIVATE gltf-demo-resources uberarchive gltfio viewer)
     target_link_libraries(gltf_instances PRIVATE gltf-demo-resources uberarchive gltfio viewer)
     target_link_libraries(hellopbr PRIVATE filameshio suzanne-resources)
     target_link_libraries(hellostereo PRIVATE filameshio suzanne-resources)
-    target_link_libraries(image_viewer PRIVATE viewer imageio)
-    target_link_libraries(materialinstancestress PRIVATE geometry filameshio suzanne-resources)
+    target_link_libraries(image_viewer PRIVATE viewer)
+    target_link_libraries(materialinstancestress PRIVATE filameshio suzanne-resources)
     target_link_libraries(multiple_windows PRIVATE filameshio suzanne-resources)
     target_link_libraries(rendertarget PRIVATE filameshio suzanne-resources)
     target_link_libraries(sample_cloth PRIVATE filameshio)
-    target_link_libraries(sample_normal_map PRIVATE filameshio)
+    target_link_libraries(sample_normal_map PRIVATE filameshio suzanne-resources)
     target_link_libraries(suzanne PRIVATE filameshio suzanne-resources)
 
     if (FILAMENT_DISABLE_MATOPT)
@@ -330,6 +358,55 @@ if (NOT ANDROID)
     # Install resources
     install(DIRECTORY ${PROJECT_BINARY_DIR}/assets/fonts DESTINATION bin/assets)
     install(DIRECTORY ${PROJECT_BINARY_DIR}/assets/ibl/ DESTINATION bin/assets/ibl)
+else()
+    # ==============================================================================================
+    # Android libfilament-samples.a
+    # ==============================================================================================
+
+    # Extract samples from FILAMENT_SAMPLES_LIST macro in SampleDispatcher.cpp (single source of truth)
+    # Ensure CMake reconfigures if SampleDispatcher.cpp is modified (e.g. samples added or removed).
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/SampleDispatcher.cpp")
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/SampleDispatcher.cpp _sample_dispatcher_src)
+    string(REGEX MATCH "FILAMENT_SAMPLES_LIST\\\(V\\\)([^#]+)" _macro_content "${_sample_dispatcher_src}")
+    string(REGEX REPLACE "//[^\n\r]*" "" _macro_content "${_macro_content}")
+    string(REGEX MATCHALL "V\\\([a-zA-Z0-9_]+\\\)" _v_matches "${_macro_content}")
+    set(ANDROID_SAMPLES "")
+    foreach(_match ${_v_matches})
+        string(REGEX REPLACE "V\\\(([a-zA-Z0-9_]+)\\\)" "\\1" _sample_name "${_match}")
+        list(APPEND ANDROID_SAMPLES ${_sample_name})
+    endforeach()
+
+    if (NOT ANDROID_SAMPLES)
+        message(FATAL_ERROR "No samples parsed from FILAMENT_SAMPLES_LIST in SampleDispatcher.cpp")
+    endif()
+
+    add_library(filament-samples STATIC
+        SampleDispatcher.cpp
+        include/samples/SampleDispatcher.h
+    )
+    target_include_directories(filament-samples PUBLIC include)
+    target_link_libraries(filament-samples PRIVATE sample-resources samples-common filamentapp)
+
+    foreach(SAMPLE ${ANDROID_SAMPLES})
+        add_library(obj_${SAMPLE} OBJECT ${SAMPLE}.cpp)
+        target_compile_definitions(obj_${SAMPLE} PRIVATE
+            createSampleApp=create_${SAMPLE}_App
+            createAppParameters=create_${SAMPLE}_AppParameters)
+        target_include_directories(obj_${SAMPLE} PRIVATE ${GENERATION_ROOT} ${FILAMENT}/filament/include ${FILAMENT}/libs/math/include ${FILAMENT}/libs/filameshio/include ${FILAMENT}/libs/ktxreader/include)
+        target_compile_options(obj_${SAMPLE} PRIVATE ${COMPILER_FLAGS})
+        target_link_libraries(obj_${SAMPLE} PRIVATE sample-resources suzanne-resources samples-common filamentapp filament)
+
+        target_sources(filament-samples PRIVATE $<TARGET_OBJECTS:obj_${SAMPLE}>)
+    endforeach()
+
+    target_link_libraries(filament-samples PRIVATE filameshio suzanne-resources ktxreader)
+    target_link_libraries(filament-samples PRIVATE android log)
+
+    install(TARGETS filament-samples ARCHIVE DESTINATION lib/${DIST_DIR})
+    install(TARGETS sample-resources ARCHIVE DESTINATION lib/${DIST_DIR})
+    install(TARGETS suzanne-resources ARCHIVE DESTINATION lib/${DIST_DIR})
+    install(TARGETS samples-common ARCHIVE DESTINATION lib/${DIST_DIR})
+    install(DIRECTORY include/samples DESTINATION include)
 endif()
 
 # ==================================================================================================

@@ -25,14 +25,16 @@
 #include "details/Scene.h"
 
 #include <private/filament/EngineEnums.h>
-#include <private/utils/Tracing.h>
-#include <private/backend/DriverApi.h>
 
 #include <filament/Box.h>
 #include <filament/View.h>
 #include <filament/Viewport.h>
 
+#include <private/backend/DriverApi.h>
+
 #include <backend/DriverEnums.h>
+
+#include <private/utils/Tracing.h>
 
 #include <utils/architecture.h>
 #include <utils/BinaryTreeArray.h>
@@ -133,7 +135,7 @@ size_t Froxelizer::getFroxelRecordBufferByteCount(FEngine::DriverApi& driverApi)
     // Make sure that targetSize is 16-byte aligned so that it'll fit properly into an array of
     // uvec4. The maximum size is 64K entries, because we're using 16 bits indices.
     size_t const targetSize = (driverApi.getMaxUniformBufferSize() / 16) * 16;
-    return std::min(size_t(std::numeric_limits<uint16_t>::max()), targetSize);
+    return std::min(size_t(std::numeric_limits<uint16_t>::max() + 1), targetSize);
 }
 
 View::FroxelConfigurationInfo Froxelizer::getFroxelConfigurationInfo() const noexcept {
@@ -164,7 +166,7 @@ Froxelizer::Froxelizer(FEngine& engine)
 
     size_t const froxelRecordBufferByteCount = getFroxelRecordBufferByteCount(driverApi);
     mFroxelRecordBufferEntryCount = froxelRecordBufferByteCount / sizeof(uint8_t);
-    assert_invariant(mFroxelRecordBufferEntryCount <= std::numeric_limits<uint16_t>::max());
+    assert_invariant(mFroxelRecordBufferEntryCount <= size_t(std::numeric_limits<uint16_t>::max()) + 1);
 
     mRecordsBuffer = driverApi.createBufferObject(
             froxelRecordBufferByteCount,
@@ -180,13 +182,7 @@ Froxelizer::~Froxelizer() {
 }
 
 void Froxelizer::terminate(DriverApi& driverApi) noexcept {
-    // call reset() on our LinearAllocator arenas
-    mArena.reset();
-
-    mBoundingSpheres = nullptr;
-    mPlanesY = nullptr;
-    mPlanesX = nullptr;
-    mDistancesZ = nullptr;
+    resetLocalArena();
 
     if (mRecordsBuffer) {
         driverApi.destroyBufferObject(mRecordsBuffer);
@@ -222,7 +218,7 @@ void Froxelizer::setProjection(const mat4f& projection,
 }
 
 bool Froxelizer::prepare(
-        FEngine::DriverApi& driverApi, RootArenaScope& rootArenaScope,
+        FEngine::DriverApi& driverApi, LinearAllocatorArena& arena,
         filament::Viewport const& viewport,
         const mat4f& projection, float const projectionNear, float const projectionFar,
         float4 const& clipTransform) noexcept {
@@ -259,12 +255,12 @@ bool Froxelizer::prepare(
 
     // light records per froxel (~256 KiB with 4096 froxels)
     mLightRecords.set(
-            rootArenaScope.allocate<LightRecord>(getFroxelBufferEntryCount(), CACHELINE_SIZE),
+            arena.alloc<LightRecord>(getFroxelBufferEntryCount(), CACHELINE_SIZE),
             getFroxelBufferEntryCount());
 
     // froxel thread data (~256KiB with 8192 max froxels and 256 lights)
     mFroxelShardedData.set(
-            rootArenaScope.allocate<FroxelThreadData>(GROUP_COUNT, CACHELINE_SIZE),
+            arena.alloc<FroxelThreadData>(GROUP_COUNT, CACHELINE_SIZE),
             uint32_t(GROUP_COUNT));
 
     assert_invariant(mFroxelBufferUser.begin());
@@ -379,7 +375,6 @@ void Froxelizer::updateBoundingSpheres(
     }
 }
 
-UTILS_NOINLINE
 bool Froxelizer::update() noexcept {
     bool uniformsNeedUpdating = false;
 
@@ -421,6 +416,7 @@ bool Froxelizer::update() noexcept {
         uint16_t froxelCountX, froxelCountY, froxelCountZ;
         computeFroxelLayout(&froxelDimension, &froxelCountX, &froxelCountY, &froxelCountZ,
                 getFroxelBufferEntryCount(), viewport);
+        const uint32_t froxelCount = uint32_t(froxelCountX * froxelCountY * froxelCountZ);
 
         mFroxelDimension = froxelDimension;
         // note: because froxelDimension is a power-of-two and viewport is an integer, mClipFroxel
@@ -437,21 +433,18 @@ bool Froxelizer::update() noexcept {
                    << getFroxelBufferEntryCount() - froxelCountX * froxelCountY * froxelCountZ
                    << " lost)";
 
-        mFroxelCountX = froxelCountX;
-        mFroxelCountY = froxelCountY;
-        mFroxelCountZ = froxelCountZ;
-        const uint32_t froxelCount = uint32_t(froxelCountX * froxelCountY * froxelCountZ);
-        mFroxelCount = froxelCount;
-
         if (mDistancesZ) {
-            // this is a LinearAllocator arena, use rewind() instead of free (which is a no op).
-            mArena.rewind(mDistancesZ);
+            resetLocalArena();
         }
 
         mDistancesZ      = mArena.alloc<float>(froxelCountZ + 1);
         mPlanesX         = mArena.alloc<float4>(froxelCountX + 1);
         mPlanesY         = mArena.alloc<float4>(froxelCountY + 1);
         mBoundingSpheres = mArena.alloc<float4>(froxelCount);
+        mFroxelCountX = froxelCountX;
+        mFroxelCountY = froxelCountY;
+        mFroxelCountZ = froxelCountZ;
+        mFroxelCount = froxelCount;
 
         assert_invariant(mDistancesZ);
         assert_invariant(mPlanesX);
@@ -561,6 +554,19 @@ bool Froxelizer::update() noexcept {
     return uniformsNeedUpdating;
 }
 
+UTILS_NOINLINE
+void Froxelizer::resetLocalArena() noexcept {
+    mArena.free(mDistancesZ, (mFroxelCountZ + 1) * sizeof(float));
+    mArena.free(mPlanesX, (mFroxelCountX + 1) * sizeof(float4));
+    mArena.free(mPlanesY, (mFroxelCountY + 1) * sizeof(float4));
+    mArena.free(mBoundingSpheres, mFroxelCount * sizeof(float4));
+    mArena.reset();
+    mBoundingSpheres = nullptr;
+    mPlanesY = nullptr;
+    mPlanesX = nullptr;
+    mDistancesZ = nullptr;
+}
+
 Froxel Froxelizer::getFroxelAt(size_t const x, size_t const y, size_t const z) const noexcept {
     assert_invariant(x < mFroxelCountX);
     assert_invariant(y < mFroxelCountY);
@@ -605,7 +611,7 @@ std::pair<size_t, size_t> Froxelizer::clipToIndices(float2 const& clip) const no
 }
 
 
-void Froxelizer::commit(DriverApi& driverApi) {
+void Froxelizer::commit(DriverApi& driverApi, LinearAllocatorArena& arena) {
     // send data to GPU
     driverApi.updateBufferObject(mFroxelsBuffer,
             { mFroxelBufferUser.data(), mFroxelBufferEntryCount * sizeof(FroxelEntry) }, 0);
@@ -613,11 +619,14 @@ void Froxelizer::commit(DriverApi& driverApi) {
     driverApi.updateBufferObject(mRecordsBuffer,
             { mRecordBufferUser.data(), mFroxelRecordBufferEntryCount }, 0);
 
-#ifndef NDEBUG
+    arena.free(mLightRecords.data(), mLightRecords.sizeInBytes());
+
+    arena.free(mFroxelShardedData.data(), mFroxelShardedData.sizeInBytes());
+
     mFroxelBufferUser.clear();
     mRecordBufferUser.clear();
+    mLightRecords.clear();
     mFroxelShardedData.clear();
-#endif
 }
 
 void Froxelizer::froxelizeLights(FEngine& engine,
@@ -659,13 +668,12 @@ void Froxelizer::froxelizeLoop(FEngine& engine,
     Slice<FroxelThreadData> froxelThreadData = mFroxelShardedData;
     memset(froxelThreadData.data(), 0, froxelThreadData.sizeInBytes());
 
-    auto& lcm = engine.getLightManager();
     auto const* UTILS_RESTRICT spheres      = lightData.data<FScene::POSITION_RADIUS>();
     auto const* UTILS_RESTRICT directions   = lightData.data<FScene::DIRECTION>();
-    auto const* UTILS_RESTRICT instances    = lightData.data<FScene::LIGHT_INSTANCE>();
+    auto const* UTILS_RESTRICT spotParams   = lightData.data<FScene::SPOT_PARAMS>();
 
     auto process = [ this, &froxelThreadData,
-                     spheres, directions, instances, &viewMatrix, &lcm ]
+                     spheres, directions, spotParams, &viewMatrix ]
             (size_t const count, size_t const offset, size_t const stride) {
 
         FILAMENT_TRACING_NAME(FILAMENT_TRACING_CATEGORY_FILAMENT, "FroxelizeLoop Job");
@@ -680,12 +688,12 @@ void Froxelizer::froxelizeLoop(FEngine& engine,
 
         for (size_t i = offset; i < count; i += stride) {
             const size_t j = i + FScene::DIRECTIONAL_LIGHTS_COUNT;
-            FLightManager::Instance const li = instances[j];
+            float2 const params = spotParams[j];
             LightParams light = {
                     .position = (viewMatrix * float4{ spheres[j].xyz, 1 }).xyz,     // to view-space
-                    .cosSqr = std::min(maxCosSquared, lcm.getCosOuterSquared(li)),  // spot only
+                    .cosSqr = std::min(maxCosSquared, params.x),                    // spot only
                     .axis = vn * directions[j],                                     // spot only
-                    .invSin = lcm.getSinInverse(li),                                // spot only
+                    .invSin = params.y,                                             // spot only
                     .radius = spheres[j].w,
             };
             // infinity means "point-light"

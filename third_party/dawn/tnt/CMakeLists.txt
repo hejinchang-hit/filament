@@ -21,6 +21,7 @@ set(DAWN_BUILD_PROTOBUF OFF)
 set(DAWN_ENABLE_DESKTOP_GL OFF)
 set(DAWN_ENABLE_OPENGLES OFF)
 set(DAWN_USE_GLFW OFF)
+set(DAWN_SUPPORTS_CXX_MODULES OFF)
 
 if (FILAMENT_BUILD_FILAMAT)
     set(TINT_BUILD_SPV_READER ON)
@@ -29,6 +30,8 @@ endif ()
 if (CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang")
     # Workaround for AppleClang 17 optimizer bug causing RTTI cast failures in Tint.
     add_compile_options(-DTINT_APPLECLANG_17_WORKAROUND=1)
+    # Silence unguarded availability warning on macOS (macOS 11.0 deployment target vs. macOS 12 kIOMainPortDefault API).
+    add_compile_options("-Wno-unguarded-availability-new")
 endif()
 
 add_subdirectory(../  ${PROJECT_BINARY_DIR}/third_party/dawn)

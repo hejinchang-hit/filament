@@ -25,6 +25,8 @@ function print_help {
     echo "        Enable matdbg."
     echo "    -t"
     echo "        Enable fgviewer."
+    echo "    -u"
+    echo "        Enable utils::Mutex debugging (lock-order inversion and self-deadlock detection)."
     echo "    -f"
     echo "        Always invoke CMake before incremental builds."
     echo "    -g"
@@ -40,12 +42,11 @@ function print_help {
     echo "    -q abi1,abi2,..."
     echo "        Where platformN is [armeabi-v7a|arm64-v8a|x86|x86_64|all]."
     echo "        ABIs to build when the platform is Android. Defaults to all."
-    echo "    -u"
-    echo "        Run all unit tests, will trigger a debug build if needed."
     echo "    -v"
     echo "        Exclude Vulkan support from the Android build."
     echo "    -E"
-    echo "        Disable C++ exceptions."
+    echo "        Disable C++ exceptions for the target build."
+    echo "        Separately built host tools retain exceptions because some tools require them."
     echo "    -W"
     echo "        Include WebGPU support for the target platform. (NOT functional atm)."
     echo "    -s"
@@ -81,8 +82,12 @@ function print_help {
     echo "        Enable perfetto traces on Android. Disabled by default on the Release build, enabled otherwise."
     echo "    -y build_type"
     echo "        Build the filament dependent tools (matc, resgen) separately from the project. This will set"
-    echo "        the tools as prebuilts that filament target will then use to build. The built_type option"
-    echo "        (debug|release) is meant to indicate the type of build of the resulting prebuilts."
+    echo "        the tools as prebuilts that filament target will then use to build. The build_type option"
+    echo "        (debug|release|none) is meant to indicate the type of build of the resulting prebuilts,"
+    echo "        or 'none' to disable the split build."
+    echo "        Defaults to 'release' (tools are always prebuilt as release unless overridden)."
+    echo "    -D"
+    echo "        Build Android Markdown documentation using Dokka."
     echo ""
     echo "Build types:"
     echo "    release"
@@ -184,13 +189,13 @@ ABI_GRADLE_OPTION="all"
 
 ISSUE_ARCHIVES=false
 BUILD_JS_DOCS=false
+BUILD_DOKKA_DOCS=false
+PLATFORM_SPECIFIED=false
 
 ISSUE_CMAKE_ALWAYS=false
 
 ANDROID_SAMPLES=()
 BUILD_ANDROID_SAMPLES=false
-
-RUN_TESTS=false
 
 INSTALL_COMMAND=
 
@@ -206,6 +211,8 @@ MATDBG_OPTION="-DFILAMENT_ENABLE_MATDBG=OFF"
 MATDBG_GRADLE_OPTION=""
 FGVIEWER_OPTION="-DFILAMENT_ENABLE_FGVIEWER=OFF"
 FGVIEWER_GRADLE_OPTION=""
+MUTEX_DEBUG_OPTION="-DFILAMENT_DEBUG_MUTEX=OFF"
+MUTEX_DEBUG_GRADLE_OPTION=""
 
 MATOPT_OPTION=""
 MATOPT_GRADLE_OPTION=""
@@ -223,8 +230,8 @@ OSMESA_OPTION=""
 IOS_BUILD_SIMULATOR=false
 BUILD_UNIVERSAL_LIBRARIES=false
 
-ISSUE_SPLIT_BUILD=false
-SPLIT_BUILD_TYPE=""
+ISSUE_SPLIT_BUILD=true
+SPLIT_BUILD_TYPE="release"
 PREBUILT_TOOLS_DIR=""
 IMPORT_EXECUTABLES_DIR_OPTION="-DIMPORT_EXECUTABLES_DIR=out"
 
@@ -271,13 +278,15 @@ function build_tools_for_split_build {
         fi
     fi
 
+    # Host tools such as cmgen use exceptions even when the target runtime does not.
     cmake \
         -G "${BUILD_GENERATOR}" \
         -DFILAMENT_EXPORT_PREBUILT_EXECUTABLES_DIR=${PREBUILT_TOOLS_DIR} \
         -DCMAKE_BUILD_TYPE="${build_type_arg}" \
         ${WEBGPU_OPTION} \
         ${architectures} \
-        ${EXCEPTIONS_OPTION} \
+        -DFILAMENT_ENABLE_EXCEPTIONS=ON \
+        ${MUTEX_DEBUG_OPTION} \
         ../..
 
     ${BUILD_COMMAND} ${WEB_HOST_TOOLS}
@@ -322,6 +331,7 @@ function build_desktop_target {
             ${STEREOSCOPIC_OPTION} \
             ${OSMESA_OPTION} \
             ${EXCEPTIONS_OPTION} \
+            ${MUTEX_DEBUG_OPTION} \
             ${architectures} \
             ../..
         ln -sf "out/cmake-${lc_target}/compile_commands.json" \
@@ -356,6 +366,55 @@ function build_desktop {
     fi
 }
 
+# ==================================================================================================
+# Emdawnwebgpu (Dawn WebGPU bindings for WebAssembly/Emscripten)
+#
+# Builds the `emdawnwebgpu_pkg` target locally from `third_party/dawn` using Emscripten.
+#
+# Why this is needed:
+#   Emscripten's built-in remote port (`--use-port=emdawnwebgpu`) downloads a pinned, pre-built
+#   snapshot of Emdawnwebgpu that may lag behind in-tree `third_party/dawn` features (such as
+#   texture component swizzles and recent WebGPU spec updates).
+#
+#   Building `emdawnwebgpu_pkg` locally generates up-to-date C/C++ headers (webgpu.h, webgpu_cpp.h)
+#   and JavaScript runtime glue (library_webgpu.js, struct info tables) directly from the in-tree
+#   Dawn schema (dawn.json). The resulting `emdawnwebgpu.port.py` is then supplied to Emscripten
+#   via `--use-port=<path_to_port.py>` during compilation and linking of Filament's WebAssembly
+#   targets.
+#
+#   Note: If you want to use Emscripten's default built-in version of the port instead of the
+#   in-tree build from third_party/dawn, change `--use-port=${dawn_port_path}` to
+#   `--use-port=emdawnwebgpu` in `build_wasm_with_target` and skip `build_wasm_dawn_package`.
+# ==================================================================================================
+function build_wasm_dawn_package {
+    local dawn_build_dir="out/cmake-wasm-dawn"
+
+    echo "Building in-tree emdawnwebgpu_pkg from third_party/dawn..."
+    mkdir -p "${dawn_build_dir}"
+
+    (
+        # Apply the Emscripten environment within a subshell.
+        # shellcheck disable=SC1090
+        source "${EMSDK}/emsdk_env.sh"
+        pushd "${dawn_build_dir}" > /dev/null
+
+        if [[ ! -d "CMakeFiles" ]] || [[ "${ISSUE_CMAKE_ALWAYS}" == "true" ]]; then
+            emcmake cmake ../../third_party/dawn \
+                -G "${BUILD_GENERATOR}" \
+                -DDAWN_ABSEIL_DIR="${PWD}/../../third_party/abseil" \
+                -DDAWN_BUILD_TESTS=OFF \
+                -DDAWN_BUILD_SAMPLES=OFF \
+                -DDAWN_BUILD_PROTOBUF=OFF \
+                -DDAWN_SUPPORTS_CXX_MODULES=OFF \
+                -DTINT_BUILD_TESTS=OFF \
+                -DTINT_BUILD_BENCHMARKS=OFF
+        fi
+
+        cmake --build . --target emdawnwebgpu_pkg
+        popd > /dev/null
+    )
+}
+
 function build_wasm_with_target {
     local lc_target=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 
@@ -369,8 +428,13 @@ function build_wasm_with_target {
     fi
 
     if [[ "${WEBGPU_OPTION}" == *"-DFILAMENT_SUPPORTS_WEBGPU=ON"* ]]; then
-        WEBGPU_OPTION="${WEBGPU_OPTION} -DCMAKE_CXX_FLAGS=\"--use-port=emdawnwebgpu\""
-        WEBGPU_OPTION="${WEBGPU_OPTION} -DCMAKE_C_FLAGS=\"--use-port=emdawnwebgpu\""
+        local root_dir="$(cd ../.. && pwd)"
+        local dawn_port_path="${root_dir}/out/cmake-wasm-dawn/emdawnwebgpu_pkg/emdawnwebgpu.port.py"
+        # Note: If you want to use Emscripten's default built-in version of the port instead
+        # of the in-tree package, replace "${dawn_port_path}" with "emdawnwebgpu"
+        # (i.e. --use-port=emdawnwebgpu).
+        WEBGPU_OPTION="${WEBGPU_OPTION} -DCMAKE_CXX_FLAGS=\"--use-port=${dawn_port_path}\""
+        WEBGPU_OPTION="${WEBGPU_OPTION} -DCMAKE_C_FLAGS=\"--use-port=${dawn_port_path}\""
     fi
 
     if [[ ! -d "CMakeFiles" ]] || [[ "${ISSUE_CMAKE_ALWAYS}" == "true" ]]; then
@@ -388,6 +452,7 @@ function build_wasm_with_target {
             ${WEBGPU_OPTION} \
             ${BACKEND_DEBUG_FLAG_OPTION} \
             ${EXCEPTIONS_OPTION} \
+            ${MUTEX_DEBUG_OPTION} \
             ../..
         ln -sf "out/cmake-wasm-${lc_target}/compile_commands.json" \
            ../../compile_commands.json
@@ -433,6 +498,10 @@ function build_wasm {
     ISSUE_DEBUG_BUILD=${old_issue_debug_build}
     ISSUE_RELEASE_BUILD=${old_issue_release_build}
 
+    if [[ "${WEBGPU_OPTION}" == *"-DFILAMENT_SUPPORTS_WEBGPU=ON"* ]]; then
+        build_wasm_dawn_package
+    fi
+
     if [[ "${ISSUE_DEBUG_BUILD}" == "true" ]]; then
         build_wasm_with_target "Debug"
     fi
@@ -468,6 +537,7 @@ function build_android_target {
             ${STEREOSCOPIC_OPTION} \
             ${ENABLE_PERFETTO} \
             ${EXCEPTIONS_OPTION} \
+            ${MUTEX_DEBUG_OPTION} \
             ../..
         ln -sf "out/cmake-android-${lc_target}-${arch}/compile_commands.json" \
            ../../compile_commands.json
@@ -581,6 +651,7 @@ function build_android {
             ${MATDBG_GRADLE_OPTION} \
             ${FGVIEWER_GRADLE_OPTION} \
             ${MATOPT_GRADLE_OPTION} \
+            ${MUTEX_DEBUG_GRADLE_OPTION} \
             :filament-android:assembleDebug \
             :gltfio-android:assembleDebug \
             :filament-utils-android:assembleDebug
@@ -636,6 +707,7 @@ function build_android {
             ${MATDBG_GRADLE_OPTION} \
             ${FGVIEWER_GRADLE_OPTION} \
             ${MATOPT_GRADLE_OPTION} \
+            ${MUTEX_DEBUG_GRADLE_OPTION} \
             :filament-android:assembleRelease \
             :gltfio-android:assembleRelease \
             :filament-utils-android:assembleRelease
@@ -710,6 +782,7 @@ function build_ios_target {
             ${MATOPT_OPTION} \
             ${STEREOSCOPIC_OPTION} \
             ${EXCEPTIONS_OPTION} \
+            ${MUTEX_DEBUG_OPTION} \
             ../..
         ln -sf "out/cmake-ios-${lc_target}-${arch}/compile_commands.json" \
            ../../compile_commands.json
@@ -869,32 +942,6 @@ function validate_build_command {
     set -e
 }
 
-function run_test {
-    local test=$1
-    # The input string might contain arguments, so we use "set -- $test" to replace $1 with the
-    # first whitespace-separated token in the string.
-    # shellcheck disable=SC2086
-    set -- ${test}
-    local test_name=$(basename "$1")
-    # shellcheck disable=SC2086
-    ./out/cmake-debug/${test} --gtest_output="xml:out/test-results/${test_name}/sponge_log.xml"
-}
-
-function run_tests {
-    if [[ "${ISSUE_WASM_BUILD}" == "true" ]]; then
-        if ! echo "TypeScript $(tsc --version)" ; then
-            tsc --noEmit \
-                third_party/gl-matrix/gl-matrix.d.ts \
-                web/filament-js/filament.d.ts \
-                web/filament-js/test.ts
-        fi
-    else
-        while read -r test; do
-            run_test "${test}"
-        done < build/common/test_list.txt
-    fi
-}
-
 function check_debug_release_build {
     if [[ "${ISSUE_DEBUG_BUILD}" == "true" || \
           "${ISSUE_RELEASE_BUILD}" == "true" || \
@@ -911,7 +958,7 @@ function check_debug_release_build {
 
 pushd "$(dirname "$0")" > /dev/null
 
-while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
+while getopts ":hacCfgDimp:q:vWslwedtk:bVx:S:X:Py:ETu" opt; do
     case ${opt} in
         h)
             print_help
@@ -937,6 +984,11 @@ while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
             FGVIEWER_OPTION="-DFILAMENT_ENABLE_FGVIEWER=ON"
             FGVIEWER_GRADLE_OPTION="-Pcom.google.android.filament.fgviewer"
             ;;
+        u)
+            MUTEX_DEBUG_OPTION="-DFILAMENT_DEBUG_MUTEX=ON"
+            MUTEX_DEBUG_GRADLE_OPTION="-Pcom.google.android.filament.mutexdebug"
+            echo "Enabled utils::Mutex debugging"
+            ;;
         f)
             ISSUE_CMAKE_ALWAYS=true
             ;;
@@ -952,6 +1004,7 @@ while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
             BUILD_COMMAND="make"
             ;;
         p)
+            PLATFORM_SPECIFIED=true
             ISSUE_DESKTOP_BUILD=false
             platforms=$(echo "${OPTARG}" | tr ',' '\n')
             for platform in ${platforms}
@@ -1021,10 +1074,6 @@ while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
                 esac
             done
             ;;
-        u)
-            ISSUE_DEBUG_BUILD=true
-            RUN_TESTS=true
-            ;;
         v)
             VULKAN_ANDROID_OPTION="-DFILAMENT_SUPPORTS_VULKAN=OFF"
             VULKAN_ANDROID_GRADLE_OPTION="-Pcom.google.android.filament.exclude-vulkan"
@@ -1057,6 +1106,9 @@ while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
         b)  ASAN_UBSAN_OPTION="-DFILAMENT_ENABLE_ASAN_UBSAN=ON"
             echo "Enabled ASAN/UBSAN"
             ;;
+        T)  ASAN_UBSAN_OPTION="-DFILAMENT_ENABLE_TSAN=ON"
+            echo "Enabled TSan"
+            ;;
         V)  COVERAGE_OPTION="-DFILAMENT_ENABLE_COVERAGE=ON"
             echo "Enabled coverage"
             ;;
@@ -1084,15 +1136,21 @@ while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
             ;;
         X)  OSMESA_OPTION="-DFILAMENT_OSMESA_PATH=${OPTARG}"
             ;;
+        D)
+            BUILD_DOKKA_DOCS=true
+            ;;
         y)
-            ISSUE_SPLIT_BUILD=true
             SPLIT_BUILD_TYPE=${OPTARG}
             case $(echo "${SPLIT_BUILD_TYPE}" | tr '[:upper:]' '[:lower:]') in
                 debug|release)
+                    ISSUE_SPLIT_BUILD=true
+                    ;;
+                none)
+                    ISSUE_SPLIT_BUILD=false
                     ;;
                 *)
                     echo "Unknown build type for -y: ${SPLIT_BUILD_TYPE}"
-                    echo "Build type must be one of [debug|release]"
+                    echo "Build type must be one of [debug|release|none]"
                     echo ""
                     exit 1
                     ;;
@@ -1113,7 +1171,7 @@ while getopts ":hacCfgimp:q:uvWslwedtk:bVx:S:X:Py:E" opt; do
     esac
 done
 
-if [[ "$#" == "0" ]]; then
+if [[ "$#" == "0" ]] && [[ "${BUILD_DOKKA_DOCS}" != "true" ]]; then
     print_help
     exit 1
 fi
@@ -1130,14 +1188,12 @@ for arg; do
     fi
 done
 
-validate_build_command
-
-if [[ "${ISSUE_SPLIT_BUILD}" == "true" ]]; then
-    # Capitalize first letter of SPLIT_BUILD_TYPE
-    SPLIT_BUILD_TYPE_CAPITALIZED="$(echo ${SPLIT_BUILD_TYPE:0:1} | tr '[:lower:]' '[:upper:]')${SPLIT_BUILD_TYPE:1}"
-    build_tools_for_split_build "${SPLIT_BUILD_TYPE_CAPITALIZED}"
-    IMPORT_EXECUTABLES_DIR_OPTION="-DFILAMENT_IMPORT_PREBUILT_EXECUTABLES_DIR=${PREBUILT_TOOLS_DIR}"
+# Prevent building desktop if only docs are requested.
+if [[ "${BUILD_DOKKA_DOCS}" == "true" ]] && [[ "${PLATFORM_SPECIFIED}" != "true" ]]; then
+    ISSUE_DESKTOP_BUILD=false
 fi
+
+validate_build_command
 
 if [[ "${ISSUE_CLEAN}" == "true" ]]; then
     build_clean
@@ -1145,6 +1201,16 @@ fi
 
 if [[ "${ISSUE_CLEAN_AGGRESSIVE}" == "true" ]]; then
     build_clean_aggressive
+fi
+
+# Only runs the split build for tools if an actual debug or release build is requested.
+# This prevents the split build from being triggered when a clean (-c or -C) is requested.
+if [[ "${ISSUE_SPLIT_BUILD}" == "true" ]] && \
+   [[ "${ISSUE_DEBUG_BUILD}" == "true" || "${ISSUE_RELEASE_BUILD}" == "true" ]]; then
+    # Capitalize first letter of SPLIT_BUILD_TYPE
+    SPLIT_BUILD_TYPE_CAPITALIZED="$(echo ${SPLIT_BUILD_TYPE:0:1} | tr '[:lower:]' '[:upper:]')${SPLIT_BUILD_TYPE:1}"
+    build_tools_for_split_build "${SPLIT_BUILD_TYPE_CAPITALIZED}"
+    IMPORT_EXECUTABLES_DIR_OPTION="-DFILAMENT_IMPORT_PREBUILT_EXECUTABLES_DIR=${PREBUILT_TOOLS_DIR}"
 fi
 
 if [[ "${ISSUE_DESKTOP_BUILD}" == "true" ]]; then
@@ -1163,8 +1229,11 @@ if [[ "${ISSUE_WASM_BUILD}" == "true" ]]; then
     check_debug_release_build build_wasm
 fi
 
-if [[ "${RUN_TESTS}" == "true" ]]; then
-    run_tests
+if [[ "${BUILD_DOKKA_DOCS}" == "true" ]]; then
+    echo "Generating Android Markdown documentation using Dokka..."
+    pushd android > /dev/null
+    ./gradlew filament-android:dokkaGfm
+    popd > /dev/null
 fi
 
 if [[ "${PRINT_MATDBG_HELP}" == "true" ]]; then
