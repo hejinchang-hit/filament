@@ -153,6 +153,7 @@ Platform::DriverConfig getDriverConfig(FEngine* instance) {
         .asynchronousMode = instance->features.backend.enable_asynchronous_operation
                                     ? instance->getConfig().asynchronousMode
                                     : AsynchronousMode::NONE,
+        .asynchronousFrameBudget = instance->getConfig().asynchronousFrameBudget,
     };
     return driverConfig;
 }
@@ -281,7 +282,11 @@ static constexpr float4 sFullScreenTriangleVertices[3] = {
 // these must be static because only a pointer is copied to the render stream
 static constexpr uint16_t sFullScreenTriangleIndices[3] = { 0, 1, 2 };
 
-FEngine::FEngine(Builder const& builder) :
+FEngine::FEngine(Builder const& builder)
+        : FEngine(builder, builder->validateConfig(builder->mConfig)) {
+}
+
+FEngine::FEngine(Builder const& builder, Config const& validatedConfig) :
         mBackend(builder->mBackend),
         mActiveFeatureLevel(builder->mFeatureLevel),
         mPlatform(builder->mPlatform),
@@ -292,20 +297,20 @@ FEngine::FEngine(Builder const& builder) :
         mTransformManager(mEntityManager),
         mLightManager(*this),
         mCameraManager(*this),
-        mMaterialCache(builder->mConfig.materialCacheCapacity, builder->mConfig.programCacheCapacity),
+        mMaterialCache(validatedConfig.materialCacheCapacity, validatedConfig.programCacheCapacity),
         mCommandBufferQueue(
-                builder->mConfig.minCommandBufferSizeMB * MiB,
-                builder->mConfig.commandBufferSizeMB * MiB,
+                validatedConfig.minCommandBufferSizeMB * MiB,
+                validatedConfig.commandBufferSizeMB * MiB,
                 builder->mPaused),
         mPerRenderPassArena(
                 "FEngine::mPerRenderPassAllocator",
-                builder->mConfig.perRenderPassArenaSizeMB * MiB + FRenderer::FRAMEGRAPH_ARENA_SIZE),
+                validatedConfig.perRenderPassArenaSizeMB * MiB + FRenderer::FRAMEGRAPH_ARENA_SIZE),
         mHeapAllocator("FEngine::mHeapAllocator", AreaPolicy::NullArea{}),
-        mJobSystem(getJobSystemThreadPoolSize(builder->mConfig)),
+        mJobSystem(getJobSystemThreadPoolSize(validatedConfig)),
         mEngineEpoch(std::chrono::steady_clock::now()),
         mDriverBarrier(1),
         mMainThreadId(ThreadUtils::getThreadId()),
-        mConfig(builder->mConfig),
+        mConfig(validatedConfig),
         mColorGradingBuilder(builder->mColorGradingBuilder)
 {
     // update all the features flags specified in the builder
@@ -349,6 +354,10 @@ FEngine::FEngine(Builder const& builder) :
             &debug.vulkan.enable_debug_utils_names);
     mDebugRegistry.registerProperty("d.vulkan.renderdoc_capture",
             &debug.vulkan.enable_renderdoc_capture);
+
+    // Renderer debug flags
+    mDebugRegistry.registerProperty("d.renderer.disable_set_presentation_time",
+            &debug.renderer.disable_set_presentation_time);
 }
 
 uint32_t FEngine::getJobSystemThreadPoolSize(Config const& config) noexcept {
@@ -360,6 +369,9 @@ uint32_t FEngine::getJobSystemThreadPoolSize(Config const& config) noexcept {
     int threadCount = int(std::thread::hardware_concurrency()) - 2;
     // make sure we have at least 1 thread though
     threadCount = std::max(1, threadCount);
+    // Leave one slot for the thread that calls Engine::create(), which adopts itself into the
+    // JobSystem.
+    threadCount = std::min(threadCount, int(JobSystem::MAX_THREADS - 1));
     return threadCount;
 }
 
@@ -382,6 +394,9 @@ void FEngine::init() {
     LOG(INFO) << "Backend feature level: " << int(driverApi.getFeatureLevel());
     LOG(INFO) << "FEngine feature level: " << int(mActiveFeatureLevel);
 
+    // the object motion vectors pass renders into an RG16F color target
+    mIsRG16FColorRenderTargetSupported =
+            driverApi.isRenderTargetFormatSupported(TextureFormat::RG16F);
 
     mResourceAllocatorDisposer = std::make_shared<TextureCacheDisposer>(driverApi);
 
@@ -502,7 +517,8 @@ void FEngine::init() {
 #endif
             break;
     }
-    mDefaultMaterial = downcast(defaultMaterialBuilder.build(*this));
+    FMaterial* const defaultMaterial = downcast(defaultMaterialBuilder.build(*this));
+    mDefaultMaterial = defaultMaterial;
 
     // We must commit the default material instance here. It may not be used in a scene, but its
     // descriptor set may still be used for shared variants.
@@ -510,7 +526,8 @@ void FEngine::init() {
     // Note that this material instance is instantiated before the creation of UboManager, so at
     // this point `isUboBatchingEnabled` is `false`, and it will fall back to individual UBO
     // automatically.
-    mDefaultMaterial->getDefaultInstance()->commit(driverApi, mUboManager);
+    mDefaultMaterialInstance = defaultMaterial->getDefaultInstance();
+    mDefaultMaterialInstance->commit(driverApi, mUboManager);
 
     if (UTILS_UNLIKELY(getSupportedFeatureLevel() >= FeatureLevel::FEATURE_LEVEL_1)) {
         // UBO batching is not supported in feature level 0
@@ -651,6 +668,8 @@ void FEngine::shutdown() {
     destroy(mDefaultColorGrading);
     mDefaultColorGrading = nullptr;
 
+    // destroying the default material destroys its default instance
+    mDefaultMaterialInstance = nullptr;
     destroy(mDefaultMaterial);
     mDefaultMaterial = nullptr;
 
@@ -738,7 +757,7 @@ void FEngine::shutdown() {
     getDriver().purgeAll();
 
     // Handle any pending deferred destruction for asynchronous objects. This must run after
-    // purgeAll() because it dispatches the completion callback that settles `mCreationStatus`,
+    // purgeAll() because it dispatches the completion callback that settles `mCreationState`,
     // which in turn is used to determine whether an object can be garbage collected below.
     if (isAsynchronousModeEnabled()) {
         gcDeferredAsyncObjectDestruction();
@@ -886,9 +905,9 @@ bool FEngine::flushAndWait(uint64_t const timeout) {
         status = fence->wait(FFence::Mode::FLUSH, timeout);
         destroy(fence);
     } else {
-        // When executing in a single-threaded (e.g. wasm) environment, fence would
-        // fail. Instead, directly execute the outstanding commands.
-        execute();
+        // Without threads nothing could signal a fence, so run the commands here instead.
+        // flush() executes them, finish() included, before it returns.
+        flush();
     }
 
     // finally, execute callbacks that might have been scheduled
@@ -991,13 +1010,11 @@ void FEngine::flushCommandBuffer(CommandBufferQueue& commandBufferQueue) const {
     }
 }
 
-const FMaterial* FEngine::getSkyboxMaterial() const noexcept {
-    FMaterial const* material = mSkyboxMaterial;
-    if (UTILS_UNLIKELY(material == nullptr)) {
-        material = FSkybox::createMaterial(*const_cast<FEngine*>(this));
-        mSkyboxMaterial = material;
+const FMaterial* FEngine::getSkyboxMaterial() noexcept {
+    if (UTILS_UNLIKELY(mSkyboxMaterial == nullptr)) {
+        mSkyboxMaterial = FSkybox::createMaterial(*this);
     }
-    return material;
+    return mSkyboxMaterial;
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -1182,6 +1199,11 @@ FCamera* FEngine::getCameraComponent(Entity const entity) noexcept {
     return ci ? mCameraManager.getCamera(ci) : nullptr;
 }
 
+FCamera const* FEngine::getCameraComponent(Entity const entity) const noexcept {
+    auto const ci = mCameraManager.getInstance(entity);
+    return ci ? mCameraManager.getCamera(ci) : nullptr;
+}
+
 void FEngine::destroyCameraComponent(Entity const entity) noexcept {
     mCameraManager.destroy(entity, *this);
 }
@@ -1214,7 +1236,7 @@ void FEngine::destroyOrDeferFrontendObject(T* p) {
     if constexpr (HasIsCreationSettled<T>::value) {
         // The presence of 'isCreationSettled' in type T implies it supports asynchronous creation.
         // While creation is in flight, the creation process holds references to the frontend object
-        // to move `mCreationStatus` out of CREATING (see FTexture::FTexture), so freeing it now
+        // to move `mCreationState` out of CREATING (see FTexture::FTexture), so freeing it now
         // would be a use-after-free on whichever thread runs the completion callback. In regular
         // (non-async) mode `isCreationSettled` always returns true, so nothing is deferred.
         if (!p->isCreationSettled()) {
@@ -1260,30 +1282,39 @@ bool FEngine::isValid(const T* ptr, ResourceList<T> const& list) const {
     return l.find(ptr) != l.end();
 }
 
+UTILS_NOINLINE
+static void logDoubleFree(void const* ptr, const char* mangledName) {
+#if UTILS_HAS_RTTI
+    auto const typeName = CallStack::demangleTypeName(mangledName);
+    const char* const typeNameCStr = typeName.c_str();
+#else
+    (void) mangledName;
+    const char* const typeNameCStr = "<no-rtti>";
+#endif
+    ASSERT_PRECONDITION_NON_FATAL(false,
+            "Object %s at %p doesn't exist (double free?)", typeNameCStr, ptr);
+}
+
 template<typename T>
 UTILS_ALWAYS_INLINE
 bool FEngine::terminateAndDestroy(const T* ptr, ResourceList<T>& list) {
     if (ptr == nullptr) return true;
-    bool const success = list.remove(ptr);
-
+    if (UTILS_UNLIKELY(!list.remove(ptr))) {
 #if UTILS_HAS_RTTI
-    auto typeName = CallStack::typeName<T>();
-    const char * const typeNameCStr = typeName.c_str();
+        logDoubleFree(ptr, typeid(T).name());
 #else
-    const char * const typeNameCStr = "<no-rtti>";
+        logDoubleFree(ptr, nullptr);
 #endif
-
-    if (ASSERT_PRECONDITION_NON_FATAL(success,
-            "Object %s at %p doesn't exist (double free?)", typeNameCStr, ptr)) {
-
-        T* p = const_cast<T*>(ptr);
-
-        // Terminate the backend resources immediately as they're unnecessary from this point. The
-        // frontend object itself may have to outlive this call, see destroyOrDeferFrontendObject().
-        p->terminate(*this);
-        destroyOrDeferFrontendObject(p);
+        return false;
     }
-    return success;
+
+    T* p = const_cast<T*>(ptr);
+
+    // Terminate the backend resources immediately as they're unnecessary from this point. The
+    // frontend object itself may have to outlive this call, see destroyOrDeferFrontendObject().
+    p->terminate(*this);
+    destroyOrDeferFrontendObject(p);
+    return true;
 }
 
 
@@ -1754,8 +1785,8 @@ FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
         tribool const shadowReceiver,
         tribool const skinning) noexcept {
 
-    // the maximum possible is 6 variants (4 color + 2 depth)
-    auto variants = FixedCapacityVector<Variant>::with_capacity(6);
+    // the maximum possible is 8 variants (4 color + 2 depth + 2 motion vectors)
+    auto variants = FixedCapacityVector<Variant>::with_capacity(8);
 
     // apply() iteratively expands the `variants` vector by mutating existing elements
     // in-place if `value` is determinate, or by duplicating them if `value` is indeterminate.
@@ -1787,9 +1818,8 @@ FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
     // isMaterialLit means shading != Shading::UNLIT || hasShadowMultiplier;
     const bool isMaterialLit = material->getDefinition().isVariantLit;
     Variant baseVariant{};
-    // TODO: Remove this after DIR is fully transferred to spec constant
-    baseVariant.setDirectionalLighting(false);
-    baseVariant.setFog(view->hasFog());
+    // TODO: Remove this after FOG is fully transferred to spec constant
+    baseVariant.setFog(false);
     baseVariant.setShadowSampler2D(isMaterialLit && view->hasShadowing() && (view->getShadowType() != ShadowType::PCF));
     baseVariant.setStereo(view->hasStereo());
 
@@ -1824,6 +1854,19 @@ FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
         apply(depthStart, skinning, &Variant::setSkinning);
     }
 
+    // Use the options-derived state rather than isMotionVectorsActive(), which is only latched
+    // by prepare(): warm-up typically happens before the first frame. Only materials without a
+    // motion vectors program are skipped: they're always drawn depth-only in the motion vectors
+    // pass (see RenderPass). Translucent ones aren't, since their instances can write depth.
+    if (view->evaluateMotionVectorsActive(material->getEngine()) &&
+            material->hasMotionVectorsVariant()) {
+        Variant motionVectorsVariant{ Variant::DEPTH_VARIANT };
+        motionVectorsVariant.setMotionVectors(true);
+        size_t const motionVectorsStart = variants.size();
+        variants.push_back(motionVectorsVariant);
+        apply(motionVectorsStart, skinning, &Variant::setSkinning);
+    }
+
     return variants;
 }
 
@@ -1836,6 +1879,9 @@ FixedCapacityVector<DynamicSpecConstKey> FEngine::getMaterialCompileDynamicSpecC
     baseKey.setDynamicLighting(isMaterialLit && view->hasDynamicLighting());
     baseKey.setExtraDirectionalLights(isMaterialLit && view->hasExtraDirectionalLights());
     baseKey.setDirectionalLighting(isMaterialLit && view->hasDirectionalLighting());
+    // Note: fog can also be disabled per renderable (RenderableManager::setFogEnabled()); like
+    // the variant-based precompile before it, we only precompile the view-level choice here.
+    baseKey.setFog(view->hasFog());
 
     keys.push_back(baseKey);
 
@@ -1923,7 +1969,6 @@ void Engine::Builder::build(Invocable<void(void*)>&& callback) const {
 #endif
 
 Engine* Engine::Builder::build() const {
-    mImpl->mConfig = BuilderDetails::validateConfig(mImpl->mConfig);
     return FEngine::create(*this);
 }
 

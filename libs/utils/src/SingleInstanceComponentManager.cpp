@@ -66,8 +66,11 @@ void SingleInstanceComponentManagerBase::recordDirtyEntity(Entity const e) noexc
 }
 
 void SingleInstanceComponentManagerBase::notifyChange(Entity const e) noexcept {
-    for (auto* bitset : mBitsets) {
-        bitset->add(e.getId());
+    uint32_t const id = e.getId();
+    for (auto const [bitset, filter] : mBitsets) {
+        if (!filter || (*filter)[id]) {
+            bitset->add(id);
+        }
     }
 
     if (UTILS_UNLIKELY(!mChangeCallbacks.empty())) {
@@ -80,8 +83,8 @@ void SingleInstanceComponentManagerBase::notifyChange(Slice<const Entity> const 
             "Entity must be layout-compatible with uint32_t for zero-copy Slice forwarding");
 
     Slice const ids{ reinterpret_cast<uint32_t const*>(entities.data()), entities.size() };
-    for (auto* bitset : mBitsets) {
-        bitset->add(ids);
+    for (auto const [bitset, filter] : mBitsets) {
+        bitset->add(ids, filter);
     }
 
     if (UTILS_UNLIKELY(!mChangeCallbacks.empty())) {
@@ -104,12 +107,16 @@ void SingleInstanceComponentManagerBase::flushNotifications() noexcept {
     }
 }
 
-void SingleInstanceComponentManagerBase::registerBitset(PagedArenaBitset* bitset) {
-    mBitsets.push_back(bitset);
+void SingleInstanceComponentManagerBase::registerBitset(
+        PagedArenaBitset* bitset, PagedArenaBitset const* filter) {
+    mBitsets.push_back({ bitset, filter });
 }
 
 void SingleInstanceComponentManagerBase::unregisterBitset(PagedArenaBitset const* bitset) {
-    mBitsets.erase(std::ranges::remove(mBitsets, bitset).begin(), mBitsets.end());
+    mBitsets.erase(
+            std::ranges::remove_if(mBitsets,
+                    [bitset](auto const& reg) { return reg.bitset == bitset; }).begin(),
+            mBitsets.end());
 }
 
 void SingleInstanceComponentManagerBase::catchupGarbage() noexcept {
@@ -141,13 +148,16 @@ void SingleInstanceComponentManagerBase::catchupGarbage() noexcept {
 }
 
 bool SingleInstanceComponentManagerBase::popPendingZombie(Entity const newEntity, Entity& outZombie) noexcept {
+    if (UTILS_LIKELY(mPendingDestruction.empty())) {
+        return false;
+    }
+
     uint32_t const index = EntityManager::getIndex(newEntity);
     // TODO: this loop will disappear once we only store the indices
     constexpr int32_t kGenerationCount = 1 << EntityManager::GENERATION_BITS;
     for (int32_t g = 0; g < kGenerationCount; ++g) {
         int32_t const potentialZombie = EntityManager::makeIdentity(g, index);
-        if (mPendingDestruction[potentialZombie]) {
-            mPendingDestruction.remove(potentialZombie);
+        if (mPendingDestruction.fetchRemove(potentialZombie)) {
             outZombie = Entity::import(potentialZombie);
             return true;
         }
@@ -155,7 +165,7 @@ bool SingleInstanceComponentManagerBase::popPendingZombie(Entity const newEntity
     return false;
 }
 
-void SingleInstanceComponentManagerBase::checkZombieCollisionPanic(Entity const newEntity) noexcept {
+UTILS_NOINLINE void SingleInstanceComponentManagerBase::checkZombieCollisionPanic(Entity const newEntity) noexcept {
     Entity zombie;
     if (UTILS_UNLIKELY(popPendingZombie(newEntity, zombie))) {
         FILAMENT_CHECK_PRECONDITION(false)
@@ -205,64 +215,59 @@ void SingleInstanceComponentManagerBase::gcImpl(uint32_t const maxDestructions,
     flush();
 }
 
-SingleInstanceComponentManagerBase::Instance
+SingleInstanceComponentManagerBase::AddResult
 SingleInstanceComponentManagerBase::addComponentImpl(Entity const e, void* context,
         SoaAllocator const allocator) noexcept {
     Instance ci = 0;
+    bool added = false;
     if (!e.isNull()) {
         resume();
         if (isAmortizationSupported()) {
             checkZombieCollisionPanic(e);
         }
 
-        if (!hasComponent(e)) {
+        auto [it, inserted] = mInstanceMap.try_emplace(e, 0);
+        if (UTILS_LIKELY(inserted)) {
             ci = allocator(context, e);
-            mInstanceMap[e] = ci;
+            it.value() = ci;
+            added = true;
             {
                 LockGuard lock(mEbrEntitiesLock);
                 mEntities.add(e.getId());
             }
             notifyChange(e);
         } else {
-            ci = mInstanceMap[e];
+            ci = it.value();
         }
     }
     assert(ci != 0);
-    return ci;
+    return { ci, added };
 }
 
 
 
-void SingleInstanceComponentManagerBase::removeComponentsImpl(Entity const* entities, size_t const count,
-        void* context, SoaDeallocator deallocator) noexcept UTILS_NO_THREAD_SAFETY_ANALYSIS {
+void SingleInstanceComponentManagerBase::eraseComponentFromMap(
+        InstanceMap::iterator const pos, Entity const e,
+        Entity const swappedEntity, Instance const index) noexcept UTILS_NO_THREAD_SAFETY_ANALYSIS {
     auto& map = mInstanceMap;
-    for (size_t k = 0; k < count; ++k) {
-        Entity const e = entities[k];
-        auto const pos = map.find(e);
-        if (UTILS_LIKELY(pos != map.end())) {
-            size_t const index = pos->second;
-            assert(index != 0);
+    map.erase_fast(pos);
 
-            auto const [lastIndex, swappedEntity] = deallocator(context, index);
-
-            if (!swappedEntity.isNull()) {
-                map[swappedEntity] = index;
-            }
-
-            map.erase(pos);
-
-            // We only need to lock mEbrEntitiesLock when writing (mutating) mEntities because the
-            // global timeline thread (EntityManager) can read it concurrently. Since component
-            // managers only run on the main thread, read-only accesses to mEntities from this
-            // class do not need synchronization.
-            {
-                LockGuard lock(mEbrEntitiesLock);
-                mEntities.remove(e.getId());
-            }
-
-            notifyChange(e);
-        }
+    if (!swappedEntity.isNull()) {
+        auto const swappedPos = map.find(swappedEntity);
+        assert(swappedPos != map.end());
+        swappedPos.value() = index;
     }
+
+    // We only need to lock mEbrEntitiesLock when writing (mutating) mEntities because the
+    // global timeline thread (EntityManager) can read it concurrently. Since component
+    // managers only run on the main thread, read-only accesses to mEntities from this
+    // class do not need synchronization.
+    {
+        LockGuard lock(mEbrEntitiesLock);
+        mEntities.remove(e.getId());
+    }
+
+    notifyChange(e);
 
     // Lock-free read check: safe because no other thread mutates mEntities.
     if (mEntities.empty()) {
